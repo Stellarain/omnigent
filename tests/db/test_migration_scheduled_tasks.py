@@ -20,6 +20,7 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -32,14 +33,20 @@ _DISPATCH_REVISION = "c8e4f2a6b901"
 
 
 @pytest.fixture
-def db_engine(tmp_path: Path) -> Iterator[Engine]:
-    """Fresh SQLite DB with the full migration chain applied; cleaned up after."""
+def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
+    """Create a migrated database or just the task tables from ORM metadata."""
     db_path = tmp_path / "test.db"
     uri = f"sqlite:///{db_path}"
-    engine = get_or_create_engine(uri)
+    if getattr(request, "param", "migration") == "metadata":
+        engine = sa.create_engine(uri)
+        SqlScheduledTask.__table__.create(engine)
+        SqlScheduledTaskRun.__table__.create(engine)
+    else:
+        engine = get_or_create_engine(uri)
     try:
         yield engine
     finally:
+        engine.dispose()
         clear_engine_cache()
 
 
@@ -50,6 +57,7 @@ def test_migration_creates_both_tables(db_engine: Engine) -> None:
     assert "scheduled_task_runs" in tables
 
 
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     """``scheduled_tasks`` has the full expected column set."""
     cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_tasks")}
@@ -82,6 +90,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     }
 
 
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
     """``scheduled_task_runs`` has the full expected column set."""
     cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
@@ -128,6 +137,7 @@ def test_no_foreign_keys(db_engine: Engine) -> None:
     assert insp.get_foreign_keys("scheduled_task_runs") == []
 
 
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_expected_indexes(db_engine: Engine) -> None:
     """Both tables expose the indexes that back the read paths."""
     insp = sa.inspect(db_engine)
@@ -308,6 +318,7 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
 
 
 @pytest.mark.parametrize("status_code", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_scheduled_task_runs_status_check_accepts_valid_code(
     db_engine: Engine, status_code: int
 ) -> None:
@@ -377,6 +388,7 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
             conn.execute(second)
 
 
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Engine) -> None:
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
     base = {"workspace_id": 1, "scheduled_task_id": b"a" * 16, "status": 1}
@@ -418,6 +430,7 @@ def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Eng
         ("scheduled_task_runs", "host_id", b"a" * 16, (b"a" * 15, b"a" * 17)),
     ],
 )
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_dispatch_fields_enforce_byte_bounds(
     db_engine: Engine,
     table_name: str,

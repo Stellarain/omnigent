@@ -78,9 +78,10 @@ def upgrade() -> None:
         batch.create_check_constraint(
             "ck_scheduled_task_runs_host_id_size", _byte_length("host_id") == 16
         )
+        # A distinct name lets CockroachDB replace the check in one transaction.
         batch.drop_constraint("ck_scheduled_task_runs_status", type_="check")
         batch.create_check_constraint(
-            "ck_scheduled_task_runs_status", "status IN (1, 2, 3, 4, 5, 6)"
+            "ck_scheduled_task_runs_dispatch_status", "status IN (1, 2, 3, 4, 5, 6)"
         )
         batch.create_unique_constraint(
             "uq_scheduled_task_runs_occurrence",
@@ -100,8 +101,12 @@ def downgrade() -> None:
 
     with op.batch_alter_table("scheduled_task_runs") as batch:
         batch.drop_index("ix_scheduled_task_runs_expired_claims")
-        batch.drop_constraint("uq_scheduled_task_runs_occurrence", type_="unique")
-        batch.drop_constraint("ck_scheduled_task_runs_status", type_="check")
+        if op.get_bind().dialect.name == "cockroachdb":
+            # CockroachDB removes unique constraints through their backing index.
+            op.execute("DROP INDEX scheduled_task_runs@uq_scheduled_task_runs_occurrence CASCADE")
+        else:
+            batch.drop_constraint("uq_scheduled_task_runs_occurrence", type_="unique")
+        batch.drop_constraint("ck_scheduled_task_runs_dispatch_status", type_="check")
         batch.create_check_constraint("ck_scheduled_task_runs_status", "status IN (1, 2, 3, 4, 5)")
         batch.drop_constraint("ck_scheduled_task_runs_trigger_key_size", type_="check")
         batch.drop_constraint("ck_scheduled_task_runs_host_id_size", type_="check")

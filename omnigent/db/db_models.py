@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
@@ -1480,6 +1481,9 @@ class SqlScheduledTask(OmnigentBase):
 
     __tablename__ = "scheduled_tasks"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    next_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1546,6 +1550,16 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
+        CheckConstraint("length(project_id) = 16", name="ck_scheduled_tasks_project_id_size"),
+        CheckConstraint(
+            "length(CAST(delegation_ref AS BLOB)) <= 1024",
+            name="ck_scheduled_tasks_delegation_ref_size",
+        ).ddl_if(dialect="sqlite"),
+        CheckConstraint(
+            "octet_length(delegation_ref) <= 1024",
+            name="ck_scheduled_tasks_delegation_ref_size",
+        ).ddl_if(callable_=lambda *_args, **kwargs: kwargs["dialect"].name != "sqlite"),
+        Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # One user-scoped listing index. Covers "a user's tasks ordered by
         # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
         # state scan reads whole rows regardless of any index.
@@ -1592,6 +1606,15 @@ class SqlScheduledTaskRun(OmnigentBase):
     """
 
     __tablename__ = "scheduled_task_runs"
+    trigger_key: Mapped[str | None] = mapped_column(
+        String(256).with_variant(
+            MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
+        nullable=True,
+    )
+    # The occurrence's assigned host, independent of later task edits.
+    host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1609,8 +1632,8 @@ class SqlScheduledTaskRun(OmnigentBase):
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
-    # skipped=5). The store converts to/from the string name at the
-    # row↔entity boundary.
+    # skipped=5). Code 6 is reserved for starting; reader/writer support is separate.
+    # The store converts to/from the string name at the row↔entity boundary.
     status: Mapped[int] = mapped_column(SmallInteger)
     scheduled_at: Mapped[int] = mapped_column(Integer)
     fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1624,8 +1647,30 @@ class SqlScheduledTaskRun(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN (1, 2, 3, 4, 5)",
-            name="ck_scheduled_task_runs_status",
+            "status IN (1, 2, 3, 4, 5, 6)",
+            name="ck_scheduled_task_runs_dispatch_status",
+        ),
+        CheckConstraint("length(host_id) = 16", name="ck_scheduled_task_runs_host_id_size"),
+        CheckConstraint(
+            "length(CAST(trigger_key AS BLOB)) <= 256",
+            name="ck_scheduled_task_runs_trigger_key_size",
+        ).ddl_if(dialect="sqlite"),
+        CheckConstraint(
+            "octet_length(trigger_key) <= 256",
+            name="ck_scheduled_task_runs_trigger_key_size",
+        ).ddl_if(callable_=lambda *_args, **kwargs: kwargs["dialect"].name != "sqlite"),
+        UniqueConstraint(
+            "workspace_id",
+            "scheduled_task_id",
+            "trigger_key",
+            name="uq_scheduled_task_runs_occurrence",
+        ),
+        Index(
+            "ix_scheduled_task_runs_expired_claims",
+            "status",
+            "lease_expires_at",
+            "workspace_id",
+            "id",
         ),
         Index(
             "ix_scheduled_task_runs_scheduled_task_id",
