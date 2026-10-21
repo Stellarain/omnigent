@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -457,17 +458,20 @@ def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
     root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
     admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
-    name = f"dispatch_{os.getpid()}"
-    if admin is not None:
-        quoted = admin.dialect.identifier_preparer.quote(name)
-        with admin.connect() as conn:
-            conn.execute(sa.text(f"CREATE DATABASE {quoted}"))
-        uri = admin.url.set(database=name).render_as_string(hide_password=False)
-    engine = sa.create_engine(uri)
-    config = _build_alembic_config(uri)
+    name = f"dispatch_{uuid4().hex}"
+    engine = None
+    database_created = False
     try:
+        if admin is not None:
+            quoted = admin.dialect.identifier_preparer.quote(name)
+            with admin.connect() as conn:
+                conn.execute(sa.text(f"CREATE DATABASE {quoted}"))
+            database_created = True
+            uri = admin.url.set(database=name).render_as_string(hide_password=False)
+        engine = sa.create_engine(uri)
+        config = _build_alembic_config(uri)
         if engine.dialect.name == "cockroachdb":
-            # CRDB bootstraps metadata; historical migrations predate its support.
+            # CRDB bootstraps metadata at head; pin rollback tests to this revision.
             engine.dispose()
             engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
             command.downgrade(config, _DISPATCH_REVISION)
@@ -475,13 +479,17 @@ def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
             command.upgrade(config, _DISPATCH_REVISION)
         yield engine
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
         clear_engine_cache()
         if admin is not None:
-            cascade = " CASCADE" if admin.dialect.name == "cockroachdb" else ""
-            with admin.connect() as conn:
-                conn.execute(sa.text(f"DROP DATABASE {quoted}{cascade}"))
-            admin.dispose()
+            try:
+                if database_created:
+                    cascade = " CASCADE" if admin.dialect.name == "cockroachdb" else ""
+                    with admin.connect() as conn:
+                        conn.execute(sa.text(f"DROP DATABASE {quoted}{cascade}"))
+            finally:
+                admin.dispose()
 
 
 def test_dispatch_migration_preserves_history_and_round_trips(
