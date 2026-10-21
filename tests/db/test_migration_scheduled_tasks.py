@@ -1,11 +1,12 @@
-"""Tests for the scheduled_tasks/scheduled_task_runs migration (z6a2b3c4d5e6).
+"""Tests for scheduled-task schemas and the dispatch-field migration.
 
 Verifies the migration creates both tables with the expected shape, that
 neither carries a database-level foreign key (schema Rule R032 — the
 ``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
 application-owned), that ``scheduled_tasks.rrule`` is NOT NULL and the
 ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
-tables cleanly.
+tables cleanly. Dispatch coverage includes occurrence deduplication, byte
+bounds, legacy writers, history preservation, and guarded rollback.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from omnigent.db.utils import (
 )
 
 _PREVIOUS_HEAD = "9d820f91deef"
+_DISPATCH_PREVIOUS = "nf12ab34cd56"
+_DISPATCH_REVISION = "c8e4f2a6b901"
 
 
 @pytest.fixture
@@ -73,6 +76,9 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "last_run_conversation_id",
         "created_at",
         "updated_at",
+        "next_run_at",
+        "project_id",
+        "delegation_ref",
     }
 
 
@@ -90,6 +96,9 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "finished_at",
         "error",
         "error_code",
+        "trigger_key",
+        "host_id",
+        "lease_expires_at",
     }
 
 
@@ -133,6 +142,12 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "created_at",
         "id",
     ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_due"] == [
+        "state",
+        "next_run_at",
+        "workspace_id",
+        "id",
+    ]
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
     # The separate created_at + user_id listing indexes were folded into the
     # single user-scope index above: with the user_id filter pushed into SQL the
@@ -152,6 +167,21 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "scheduled_task_id",
         "scheduled_at",
         "id",
+    ]
+    assert runs_idx_cols["ix_scheduled_task_runs_expired_claims"] == [
+        "status",
+        "lease_expires_at",
+        "workspace_id",
+        "id",
+    ]
+    unique_keys = {
+        key["name"]: key["column_names"]
+        for key in insp.get_unique_constraints("scheduled_task_runs")
+    }
+    assert unique_keys["uq_scheduled_task_runs_occurrence"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "trigger_key",
     ]
 
 
@@ -262,7 +292,7 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
     """The ``scheduled_task_runs.status`` CHECK rejects codes outside the closed set.
 
     Status is stored as a stable int code (see enum_codecs
-    SCHEDULED_TASK_RUN_STATUS, codes 1-5); a code outside that range must fail
+    SCHEDULED_TASK_RUN_STATUS, codes 1-5, plus reserved starting=6); other codes fail
     the CHECK.
     """
     with pytest.raises(IntegrityError):
@@ -277,7 +307,10 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
             )
 
 
-def test_scheduled_task_runs_status_check_accepts_valid_code(db_engine: Engine) -> None:
+@pytest.mark.parametrize("status_code", [1, 2, 3, 4, 5, 6])
+def test_scheduled_task_runs_status_check_accepts_valid_code(
+    db_engine: Engine, status_code: int
+) -> None:
     """A valid status code inserts cleanly."""
     with db_engine.begin() as conn:
         conn.execute(
@@ -285,8 +318,9 @@ def test_scheduled_task_runs_status_check_accepts_valid_code(db_engine: Engine) 
                 "INSERT INTO scheduled_task_runs "
                 "(id, scheduled_task_id, status, scheduled_at) "
                 "VALUES (X'000000000000000000000000000000c0', "
-                "X'00000000000000000000000000000001', 1, 1)"  # 1 = 'scheduled'
-            )
+                "X'00000000000000000000000000000001', :status, 1)"
+            ),
+            {"status": status_code},
         )
         status = conn.execute(
             sa.text(
@@ -294,13 +328,236 @@ def test_scheduled_task_runs_status_check_accepts_valid_code(db_engine: Engine) 
                 "WHERE id = X'000000000000000000000000000000c0'"
             )
         ).scalar_one()
-    assert status == 1
+    assert status == status_code
 
 
 def test_scheduled_task_runs_status_stored_as_smallint(db_engine: Engine) -> None:
     """The ``status`` column is an integer type, not a VARCHAR."""
     cols = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
     assert "INT" in str(cols["status"]["type"]).upper()
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "task_id", "trigger_key", "duplicate"),
+    [
+        (1, b"a" * 16, "schedule:1792659600", True),
+        (2, b"a" * 16, "schedule:1792659600", False),
+        (1, b"b" * 16, "schedule:1792659600", False),
+        (1, b"a" * 16, "manual:request-1", False),
+        (1, b"a" * 16, "manual:request-2", False),
+        (1, b"a" * 16, "event:github:delivery-1", False),
+    ],
+)
+def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
+    db_engine: Engine, workspace_id: int, task_id: bytes, trigger_key: str, duplicate: bool
+) -> None:
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            runs.insert().values(
+                workspace_id=1,
+                id=b"1" * 16,
+                scheduled_task_id=b"a" * 16,
+                status=6,
+                scheduled_at=1792659600,
+                trigger_key="schedule:1792659600",
+            )
+        )
+    second = runs.insert().values(
+        workspace_id=workspace_id,
+        id=b"2" * 16,
+        scheduled_task_id=task_id,
+        status=6,
+        scheduled_at=1792659600,
+        trigger_key=trigger_key,
+    )
+    if duplicate:
+        with pytest.raises(IntegrityError), db_engine.begin() as conn:
+            conn.execute(second)
+    else:
+        with db_engine.begin() as conn:
+            conn.execute(second)
+
+
+def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Engine) -> None:
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
+    base = {"workspace_id": 1, "scheduled_task_id": b"a" * 16, "status": 1}
+    with db_engine.begin() as conn:
+        conn.execute(
+            runs.insert().values(
+                **base, id=b"1" * 16, scheduled_at=100, trigger_key="event:source:AbC"
+            )
+        )
+        conn.execute(
+            runs.insert().values(
+                **base, id=b"2" * 16, scheduled_at=100, trigger_key="event:source:abc"
+            )
+        )
+    with pytest.raises(IntegrityError), db_engine.begin() as conn:
+        conn.execute(
+            runs.insert().values(
+                **base, id=b"3" * 16, scheduled_at=200, trigger_key="event:source:AbC"
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("table_name", "field", "limit"),
+    [("scheduled_tasks", "delegation_ref", 1024), ("scheduled_task_runs", "trigger_key", 256)],
+)
+def test_dispatch_strings_enforce_byte_limits(
+    db_engine: Engine, table_name: str, field: str, limit: int
+) -> None:
+    table = sa.Table(table_name, sa.MetaData(), autoload_with=db_engine)
+    values = (
+        {
+            "name": "n",
+            "prompt": b"p",
+            "rrule": "FREQ=DAILY",
+            "agent_id": b"a" * 16,
+            "created_at": 1,
+        }
+        if table_name == "scheduled_tasks"
+        else {"scheduled_task_id": b"a" * 16, "status": 1, "scheduled_at": 1}
+    )
+    if table_name == "scheduled_tasks":
+        values["timezone"] = "UTC"
+    with db_engine.begin() as conn:
+        conn.execute(table.insert().values(**values, id=b"1" * 16, **{field: "é" * (limit // 2)}))
+    # SQLite does not enforce VARCHAR lengths, and text length stops at a NUL.
+    for oversized in ("x" * (limit + 1), "é" * (limit // 2 + 1), "\0" + "x" * limit):
+        with pytest.raises(IntegrityError), db_engine.begin() as conn:
+            conn.execute(table.insert().values(**values, id=b"2" * 16, **{field: oversized}))
+
+
+def test_dispatch_migration_preserves_history_and_round_trips(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
+    engine = sa.create_engine(uri)
+    config = _build_alembic_config(uri)
+    try:
+        with engine.begin() as conn:
+            config.attributes["connection"] = conn
+            command.upgrade(config, _DISPATCH_PREVIOUS)
+        tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+        runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+        with engine.begin() as conn:
+            conn.execute(
+                tasks.insert().values(
+                    id=b"a" * 16,
+                    name="daily",
+                    prompt=b"p",
+                    rrule="FREQ=DAILY",
+                    agent_id=b"g" * 16,
+                    timezone="UTC",
+                    created_at=1,
+                )
+            )
+            conn.execute(
+                runs.insert(),
+                [
+                    {
+                        "id": run_id,
+                        "scheduled_task_id": b"a" * 16,
+                        "status": 3,
+                        "scheduled_at": 100,
+                    }
+                    for run_id in (b"1" * 16, b"2" * 16)
+                ],
+            )
+            config.attributes["connection"] = conn
+            command.upgrade(config, _DISPATCH_REVISION)
+        new_tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+        new_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+        for table, columns in (
+            (new_tasks, ["next_run_at", "project_id", "delegation_ref"]),
+            (new_runs, ["host_id", "trigger_key", "lease_expires_at"]),
+        ):
+            assert all(table.c[column].nullable for column in columns)
+            with engine.connect() as conn:
+                rows = conn.execute(sa.select(*(table.c[column] for column in columns))).all()
+                assert rows and all(tuple(row) == (None, None, None) for row in rows)
+        with engine.begin() as conn:
+            # An old writer can still insert an occurrence with the same timestamp.
+            conn.execute(
+                runs.insert().values(
+                    id=b"3" * 16,
+                    scheduled_task_id=b"a" * 16,
+                    status=3,
+                    scheduled_at=100,
+                )
+            )
+            conn.execute(
+                new_tasks.update()
+                .where(new_tasks.c.id == b"a" * 16)
+                .values(
+                    next_run_at=2**31 + 100,
+                    project_id=b"p" * 16,
+                    delegation_ref="delegations/example",
+                )
+            )
+            conn.execute(
+                new_runs.update()
+                .where(new_runs.c.id == b"1" * 16)
+                .values(
+                    host_id=b"h" * 16,
+                    trigger_key="schedule:100",
+                    lease_expires_at=2**31 + 120,
+                )
+            )
+            assert conn.execute(
+                sa.select(
+                    new_tasks.c.next_run_at,
+                    new_tasks.c.project_id,
+                    new_tasks.c.delegation_ref,
+                )
+            ).one() == (2**31 + 100, b"p" * 16, "delegations/example")
+            assert conn.execute(
+                sa.select(
+                    new_runs.c.host_id,
+                    new_runs.c.trigger_key,
+                    new_runs.c.lease_expires_at,
+                ).where(new_runs.c.id == b"1" * 16)
+            ).one() == (b"h" * 16, "schedule:100", 2**31 + 120)
+            config.attributes["connection"] = conn
+            command.downgrade(config, _DISPATCH_PREVIOUS)
+        assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")} == set(
+            tasks.c.keys()
+        )
+        assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")} == set(
+            runs.c.keys()
+        )
+        with engine.begin() as conn:
+            assert conn.execute(sa.select(runs.c.status)).scalars().all() == [3, 3, 3]
+            config.attributes["connection"] = conn
+            command.upgrade(config, _DISPATCH_REVISION)
+    finally:
+        engine.dispose()
+
+
+def test_dispatch_downgrade_refuses_starting_runs(db_engine: Engine) -> None:
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            runs.insert().values(
+                id=b"1" * 16,
+                scheduled_task_id=b"a" * 16,
+                status=6,
+                scheduled_at=1,
+            )
+        )
+    config = _build_alembic_config(str(db_engine.url))
+    with pytest.raises(RuntimeError, match="Reconcile starting"), db_engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_PREVIOUS)
+    with db_engine.connect() as conn:
+        assert conn.execute(sa.select(runs.c.status)).scalar_one() == 6
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _DISPATCH_REVISION
+        )
+    assert "trigger_key" in {
+        c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")
+    }
 
 
 def test_downgrade_drops_both_tables(tmp_path: Path) -> None:

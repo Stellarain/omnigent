@@ -1,0 +1,119 @@
+"""Add persistence for scheduled-task dispatch.
+
+Revision ID: c8e4f2a6b901
+Revises: nf12ab34cd56
+
+Deploy before the scheduler/fire-path changes. All six columns are nullable:
+existing tasks need next-run initialization, historical runs have no reliable
+trigger identity, and old writers must continue to work. NULL trigger keys do
+not participate in occurrence deduplication; new claim writers must supply one.
+Timestamps are UTC epoch seconds stored as BIGINT. The two scan indexes end
+with the full primary key for bounded, deterministic cross-workspace paging.
+
+Delegation references are bounded to 1,024 UTF-8 bytes and trigger keys to 256
+UTF-8 bytes, including their namespace. Trigger keys use case-sensitive MySQL
+comparison; callers must generate canonical keys without trailing whitespace.
+Status 6 is reserved for starting; codes 1-5 retain their existing meanings.
+Application codecs, stores, and API changes ship separately; do not write
+status 6 until all readers support it. No scheduling or dispatch is enabled here.
+
+Rollback: stop new writers and reconcile all starting runs before downgrading.
+Downgrade refuses while status 6 exists and otherwise discards the new fields;
+back up populated fields before a schema rollback. Older binaries reject an
+unknown Alembic revision, so application rollback also needs schema compatibility.
+Managed installations require matching changes in their managed migration layer.
+"""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects.mysql import VARCHAR
+
+from omnigent.db.db_models import Uuid16
+
+revision: str = "c8e4f2a6b901"
+down_revision: str | None = "nf12ab34cd56"
+branch_labels: tuple[str, ...] | None = None
+depends_on: tuple[str, ...] | None = None
+
+
+def _byte_length(column: str) -> sa.ColumnElement:
+    value = sa.column(column)
+    if op.get_bind().dialect.name == "sqlite":
+        return sa.func.length(sa.cast(value, sa.LargeBinary()))
+    return sa.func.octet_length(value)
+
+
+def upgrade() -> None:
+    """Add nullable dispatch fields, occurrence uniqueness, and scan indexes."""
+    with op.batch_alter_table("scheduled_tasks") as batch:
+        batch.add_column(sa.Column("next_run_at", sa.BigInteger(), nullable=True))
+        batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
+        batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
+        batch.create_check_constraint(
+            "ck_scheduled_tasks_delegation_ref_size", _byte_length("delegation_ref") <= 1024
+        )
+        batch.create_check_constraint(
+            "ck_scheduled_tasks_project_id_size", _byte_length("project_id") == 16
+        )
+        batch.create_index(
+            "ix_scheduled_tasks_due", ["state", "next_run_at", "workspace_id", "id"]
+        )
+
+    with op.batch_alter_table("scheduled_task_runs") as batch:
+        batch.add_column(
+            sa.Column(
+                "trigger_key",
+                sa.String(256).with_variant(
+                    VARCHAR(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+                ),
+                nullable=True,
+            )
+        )
+        batch.add_column(sa.Column("host_id", Uuid16(), nullable=True))
+        batch.add_column(sa.Column("lease_expires_at", sa.BigInteger(), nullable=True))
+        batch.create_check_constraint(
+            "ck_scheduled_task_runs_trigger_key_size", _byte_length("trigger_key") <= 256
+        )
+        batch.create_check_constraint(
+            "ck_scheduled_task_runs_host_id_size", _byte_length("host_id") == 16
+        )
+        batch.drop_constraint("ck_scheduled_task_runs_status", type_="check")
+        batch.create_check_constraint(
+            "ck_scheduled_task_runs_status", "status IN (1, 2, 3, 4, 5, 6)"
+        )
+        batch.create_unique_constraint(
+            "uq_scheduled_task_runs_occurrence",
+            ["workspace_id", "scheduled_task_id", "trigger_key"],
+        )
+        batch.create_index(
+            "ix_scheduled_task_runs_expired_claims",
+            ["status", "lease_expires_at", "workspace_id", "id"],
+        )
+
+
+def downgrade() -> None:
+    """Restore the previous schema only after starting runs have been reconciled."""
+    runs = sa.table("scheduled_task_runs", sa.column("status"))
+    if op.get_bind().execute(sa.select(runs.c.status).where(runs.c.status == 6).limit(1)).first():
+        raise RuntimeError("Reconcile starting scheduled-task runs before downgrading")
+
+    with op.batch_alter_table("scheduled_task_runs") as batch:
+        batch.drop_index("ix_scheduled_task_runs_expired_claims")
+        batch.drop_constraint("uq_scheduled_task_runs_occurrence", type_="unique")
+        batch.drop_constraint("ck_scheduled_task_runs_status", type_="check")
+        batch.create_check_constraint("ck_scheduled_task_runs_status", "status IN (1, 2, 3, 4, 5)")
+        batch.drop_constraint("ck_scheduled_task_runs_trigger_key_size", type_="check")
+        batch.drop_constraint("ck_scheduled_task_runs_host_id_size", type_="check")
+        batch.drop_column("lease_expires_at")
+        batch.drop_column("host_id")
+        batch.drop_column("trigger_key")
+
+    with op.batch_alter_table("scheduled_tasks") as batch:
+        batch.drop_index("ix_scheduled_tasks_due")
+        batch.drop_constraint("ck_scheduled_tasks_delegation_ref_size", type_="check")
+        batch.drop_constraint("ck_scheduled_tasks_project_id_size", type_="check")
+        batch.drop_column("delegation_ref")
+        batch.drop_column("project_id")
+        batch.drop_column("next_run_at")
