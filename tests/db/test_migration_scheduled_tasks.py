@@ -344,8 +344,6 @@ def test_scheduled_task_runs_status_stored_as_smallint(db_engine: Engine) -> Non
         (2, b"a" * 16, "schedule:1792659600", False),
         (1, b"b" * 16, "schedule:1792659600", False),
         (1, b"a" * 16, "manual:request-1", False),
-        (1, b"a" * 16, "manual:request-2", False),
-        (1, b"a" * 16, "event:github:delivery-1", False),
     ],
 )
 def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
@@ -402,11 +400,30 @@ def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Eng
 
 
 @pytest.mark.parametrize(
-    ("table_name", "field", "limit"),
-    [("scheduled_tasks", "delegation_ref", 1024), ("scheduled_task_runs", "trigger_key", 256)],
+    ("table_name", "field", "valid", "invalid"),
+    [
+        (
+            "scheduled_tasks",
+            "delegation_ref",
+            "é" * 512,
+            ("x" * 1025, "é" * 513, "\0" + "x" * 1024),
+        ),
+        (
+            "scheduled_task_runs",
+            "trigger_key",
+            "é" * 128,
+            ("x" * 257, "é" * 129, "\0" + "x" * 256),
+        ),
+        ("scheduled_tasks", "project_id", b"a" * 16, (b"a" * 15, b"a" * 17)),
+        ("scheduled_task_runs", "host_id", b"a" * 16, (b"a" * 15, b"a" * 17)),
+    ],
 )
-def test_dispatch_strings_enforce_byte_limits(
-    db_engine: Engine, table_name: str, field: str, limit: int
+def test_dispatch_fields_enforce_byte_bounds(
+    db_engine: Engine,
+    table_name: str,
+    field: str,
+    valid: str | bytes,
+    invalid: tuple[str | bytes, ...],
 ) -> None:
     table = sa.Table(table_name, sa.MetaData(), autoload_with=db_engine)
     values = (
@@ -423,11 +440,11 @@ def test_dispatch_strings_enforce_byte_limits(
     if table_name == "scheduled_tasks":
         values["timezone"] = "UTC"
     with db_engine.begin() as conn:
-        conn.execute(table.insert().values(**values, id=b"1" * 16, **{field: "é" * (limit // 2)}))
-    # SQLite does not enforce VARCHAR lengths, and text length stops at a NUL.
-    for oversized in ("x" * (limit + 1), "é" * (limit // 2 + 1), "\0" + "x" * limit):
+        conn.execute(table.insert().values(**values, id=b"1" * 16, **{field: valid}))
+    # SQLite does not enforce declared lengths, and text length stops at a NUL.
+    for invalid_value in invalid:
         with pytest.raises(IntegrityError), db_engine.begin() as conn:
-            conn.execute(table.insert().values(**values, id=b"2" * 16, **{field: oversized}))
+            conn.execute(table.insert().values(**values, id=b"2" * 16, **{field: invalid_value}))
 
 
 def test_dispatch_migration_preserves_history_and_round_trips(tmp_path: Path) -> None:

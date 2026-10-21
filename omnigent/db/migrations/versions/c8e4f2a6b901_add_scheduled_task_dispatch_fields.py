@@ -21,7 +21,6 @@ Rollback: stop new writers and reconcile all starting runs before downgrading.
 Downgrade refuses while status 6 exists and otherwise discards the new fields;
 back up populated fields before a schema rollback. Older binaries reject an
 unknown Alembic revision, so application rollback also needs schema compatibility.
-Managed installations require matching changes in their managed migration layer.
 """
 
 from __future__ import annotations
