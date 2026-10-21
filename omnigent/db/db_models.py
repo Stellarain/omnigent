@@ -1483,6 +1483,7 @@ class SqlScheduledTask(OmnigentBase):
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     next_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Opaque grant reference, never credentials; capped at 1,024 UTF-8 bytes.
     delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
@@ -1550,19 +1551,24 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        CheckConstraint("length(project_id) = 16", name="ck_scheduled_tasks_project_id_size"),
         CheckConstraint(
             "length(CAST(delegation_ref AS BLOB)) <= 1024",
             name="ck_scheduled_tasks_delegation_ref_size",
-        ).ddl_if(dialect="sqlite"),
+        ).ddl_if(
+            callable_=lambda *_args, **kwargs: (
+                kwargs["dialect"].name in ("sqlite", "cloudflare_d1")
+            )
+        ),
         CheckConstraint(
             "octet_length(delegation_ref) <= 1024",
             name="ck_scheduled_tasks_delegation_ref_size",
-        ).ddl_if(callable_=lambda *_args, **kwargs: kwargs["dialect"].name != "sqlite"),
+        ).ddl_if(
+            callable_=lambda *_args, **kwargs: (
+                kwargs["dialect"].name not in ("sqlite", "cloudflare_d1")
+            )
+        ),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
-        # One user-scoped listing index. Covers "a user's tasks ordered by
-        # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
-        # state scan reads whole rows regardless of any index.
+        # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
             "workspace_id",
@@ -1606,6 +1612,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     """
 
     __tablename__ = "scheduled_task_runs"
+    # Canonical occurrence key: at most 256 UTF-8 bytes, without trailing whitespace.
     trigger_key: Mapped[str | None] = mapped_column(
         String(256).with_variant(
             MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
@@ -1630,10 +1637,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
-    # skipped=5). Code 6 is reserved for starting; reader/writer support is separate.
-    # The store converts to/from the string name at the row↔entity boundary.
+    # SCHEDULED_TASK_RUN_STATUS int code; 6 is reserved for starting.
     status: Mapped[int] = mapped_column(SmallInteger)
     scheduled_at: Mapped[int] = mapped_column(Integer)
     fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1650,15 +1654,22 @@ class SqlScheduledTaskRun(OmnigentBase):
             "status IN (1, 2, 3, 4, 5, 6)",
             name="ck_scheduled_task_runs_dispatch_status",
         ),
-        CheckConstraint("length(host_id) = 16", name="ck_scheduled_task_runs_host_id_size"),
         CheckConstraint(
             "length(CAST(trigger_key AS BLOB)) <= 256",
             name="ck_scheduled_task_runs_trigger_key_size",
-        ).ddl_if(dialect="sqlite"),
+        ).ddl_if(
+            callable_=lambda *_args, **kwargs: (
+                kwargs["dialect"].name in ("sqlite", "cloudflare_d1")
+            )
+        ),
         CheckConstraint(
             "octet_length(trigger_key) <= 256",
             name="ck_scheduled_task_runs_trigger_key_size",
-        ).ddl_if(callable_=lambda *_args, **kwargs: kwargs["dialect"].name != "sqlite"),
+        ).ddl_if(
+            callable_=lambda *_args, **kwargs: (
+                kwargs["dialect"].name not in ("sqlite", "cloudflare_d1")
+            )
+        ),
         UniqueConstraint(
             "workspace_id",
             "scheduled_task_id",

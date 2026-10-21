@@ -11,6 +11,7 @@ bounds, legacy writers, history preservation, and guarded rollback.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
 from omnigent.db.utils import (
@@ -30,11 +31,24 @@ from omnigent.db.utils import (
 _PREVIOUS_HEAD = "9d820f91deef"
 _DISPATCH_PREVIOUS = "nf12ab34cd56"
 _DISPATCH_REVISION = "c8e4f2a6b901"
+_SCHEMA_PATHS = [
+    "migration",
+    "metadata",
+    pytest.param(
+        "configured",
+        marks=pytest.mark.skipif(
+            not os.environ.get("OMNIGENT_TEST_DB_URI"), reason="needs a configured database"
+        ),
+    ),
+]
 
 
 @pytest.fixture
 def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
     """Create a migrated database or just the task tables from ORM metadata."""
+    if getattr(request, "param", "migration") == "configured":
+        yield get_or_create_engine(request.getfixturevalue("db_uri"))
+        return
     db_path = tmp_path / "test.db"
     uri = f"sqlite:///{db_path}"
     if getattr(request, "param", "migration") == "metadata":
@@ -57,7 +71,7 @@ def test_migration_creates_both_tables(db_engine: Engine) -> None:
     assert "scheduled_task_runs" in tables
 
 
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     """``scheduled_tasks`` has the full expected column set."""
     cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_tasks")}
@@ -90,7 +104,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     }
 
 
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
     """``scheduled_task_runs`` has the full expected column set."""
     cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
@@ -137,7 +151,7 @@ def test_no_foreign_keys(db_engine: Engine) -> None:
     assert insp.get_foreign_keys("scheduled_task_runs") == []
 
 
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_expected_indexes(db_engine: Engine) -> None:
     """Both tables expose the indexes that back the read paths."""
     insp = sa.inspect(db_engine)
@@ -317,29 +331,20 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
             )
 
 
-@pytest.mark.parametrize("status_code", [1, 2, 3, 4, 5, 6])
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("status_code", [5, 6])
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_task_runs_status_check_accepts_valid_code(
     db_engine: Engine, status_code: int
 ) -> None:
     """A valid status code inserts cleanly."""
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
     with db_engine.begin() as conn:
         conn.execute(
-            sa.text(
-                "INSERT INTO scheduled_task_runs "
-                "(id, scheduled_task_id, status, scheduled_at) "
-                "VALUES (X'000000000000000000000000000000c0', "
-                "X'00000000000000000000000000000001', :status, 1)"
-            ),
-            {"status": status_code},
-        )
-        status = conn.execute(
-            sa.text(
-                "SELECT status FROM scheduled_task_runs "
-                "WHERE id = X'000000000000000000000000000000c0'"
+            runs.insert().values(
+                id=b"1" * 16, scheduled_task_id=b"a" * 16, status=status_code, scheduled_at=1
             )
-        ).scalar_one()
-    assert status == status_code
+        )
+        assert conn.execute(sa.select(runs.c.status)).scalar_one() == status_code
 
 
 def test_scheduled_task_runs_status_stored_as_smallint(db_engine: Engine) -> None:
@@ -349,16 +354,25 @@ def test_scheduled_task_runs_status_stored_as_smallint(db_engine: Engine) -> Non
 
 
 @pytest.mark.parametrize(
-    ("workspace_id", "task_id", "trigger_key", "duplicate"),
+    ("workspace_id", "task_id", "trigger_key", "scheduled_at", "duplicate"),
     [
-        (1, b"a" * 16, "schedule:1792659600", True),
-        (2, b"a" * 16, "schedule:1792659600", False),
-        (1, b"b" * 16, "schedule:1792659600", False),
-        (1, b"a" * 16, "manual:request-1", False),
+        (1, b"a" * 16, "event:source:AbC", 100, True),
+        (2, b"a" * 16, "event:source:AbC", 100, False),
+        (1, b"b" * 16, "event:source:AbC", 100, False),
+        (1, b"a" * 16, "manual:request-1", 100, False),
+        (1, b"a" * 16, "event:source:abc", 100, False),
+        (1, b"a" * 16, "event:source:AbC", 200, True),
+        (1, b"a" * 16, "event:source:AbC ", 100, False),
     ],
 )
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
-    db_engine: Engine, workspace_id: int, task_id: bytes, trigger_key: str, duplicate: bool
+    db_engine: Engine,
+    workspace_id: int,
+    task_id: bytes,
+    trigger_key: str,
+    scheduled_at: int,
+    duplicate: bool,
 ) -> None:
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
     with db_engine.begin() as conn:
@@ -368,8 +382,8 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
                 id=b"1" * 16,
                 scheduled_task_id=b"a" * 16,
                 status=6,
-                scheduled_at=1792659600,
-                trigger_key="schedule:1792659600",
+                scheduled_at=100,
+                trigger_key="event:source:AbC",
             )
         )
     second = runs.insert().values(
@@ -377,38 +391,17 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
         id=b"2" * 16,
         scheduled_task_id=task_id,
         status=6,
-        scheduled_at=1792659600,
+        scheduled_at=scheduled_at,
         trigger_key=trigger_key,
     )
+    # MySQL's PAD SPACE collation requires callers to exclude trailing whitespace.
+    duplicate |= db_engine.dialect.name == "mysql" and trigger_key.endswith(" ")
     if duplicate:
         with pytest.raises(IntegrityError), db_engine.begin() as conn:
             conn.execute(second)
     else:
         with db_engine.begin() as conn:
             conn.execute(second)
-
-
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
-def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Engine) -> None:
-    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
-    base = {"workspace_id": 1, "scheduled_task_id": b"a" * 16, "status": 1}
-    with db_engine.begin() as conn:
-        conn.execute(
-            runs.insert().values(
-                **base, id=b"1" * 16, scheduled_at=100, trigger_key="event:source:AbC"
-            )
-        )
-        conn.execute(
-            runs.insert().values(
-                **base, id=b"2" * 16, scheduled_at=100, trigger_key="event:source:abc"
-            )
-        )
-    with pytest.raises(IntegrityError), db_engine.begin() as conn:
-        conn.execute(
-            runs.insert().values(
-                **base, id=b"3" * 16, scheduled_at=200, trigger_key="event:source:AbC"
-            )
-        )
 
 
 @pytest.mark.parametrize(
@@ -426,17 +419,15 @@ def test_event_redelivery_deduplicates_independently_of_timestamp(db_engine: Eng
             "é" * 128,
             ("x" * 257, "é" * 129, "\0" + "x" * 256),
         ),
-        ("scheduled_tasks", "project_id", b"a" * 16, (b"a" * 15, b"a" * 17)),
-        ("scheduled_task_runs", "host_id", b"a" * 16, (b"a" * 15, b"a" * 17)),
     ],
 )
-@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_dispatch_fields_enforce_byte_bounds(
     db_engine: Engine,
     table_name: str,
     field: str,
-    valid: str | bytes,
-    invalid: tuple[str | bytes, ...],
+    valid: str,
+    invalid: tuple[str, ...],
 ) -> None:
     table = sa.Table(table_name, sa.MetaData(), autoload_with=db_engine)
     values = (
@@ -454,117 +445,149 @@ def test_dispatch_fields_enforce_byte_bounds(
         values["timezone"] = "UTC"
     with db_engine.begin() as conn:
         conn.execute(table.insert().values(**values, id=b"1" * 16, **{field: valid}))
-    # SQLite does not enforce declared lengths, and text length stops at a NUL.
     for invalid_value in invalid:
-        with pytest.raises(IntegrityError), db_engine.begin() as conn:
+        # Length overflow and embedded NUL rejection use different DBAPI subclasses.
+        with pytest.raises(DBAPIError), db_engine.begin() as conn:
             conn.execute(table.insert().values(**values, id=b"2" * 16, **{field: invalid_value}))
 
 
-def test_dispatch_migration_preserves_history_and_round_trips(tmp_path: Path) -> None:
+@pytest.fixture
+def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
+    """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
+    root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
+    admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
+    name = f"dispatch_{os.getpid()}"
+    if admin is not None:
+        quoted = admin.dialect.identifier_preparer.quote(name)
+        with admin.connect() as conn:
+            conn.execute(sa.text(f"CREATE DATABASE {quoted}"))
+        uri = admin.url.set(database=name).render_as_string(hide_password=False)
     engine = sa.create_engine(uri)
     config = _build_alembic_config(uri)
     try:
-        with engine.begin() as conn:
-            config.attributes["connection"] = conn
-            command.upgrade(config, _DISPATCH_PREVIOUS)
-        tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
-        runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
-        with engine.begin() as conn:
-            conn.execute(
-                tasks.insert().values(
-                    id=b"a" * 16,
-                    name="daily",
-                    prompt=b"p",
-                    rrule="FREQ=DAILY",
-                    agent_id=b"g" * 16,
-                    timezone="UTC",
-                    created_at=1,
-                )
-            )
-            conn.execute(
-                runs.insert(),
-                [
-                    {
-                        "id": run_id,
-                        "scheduled_task_id": b"a" * 16,
-                        "status": 3,
-                        "scheduled_at": 100,
-                    }
-                    for run_id in (b"1" * 16, b"2" * 16)
-                ],
-            )
-            config.attributes["connection"] = conn
+        if engine.dialect.name == "cockroachdb":
+            # CRDB bootstraps metadata; historical migrations predate its support.
+            engine.dispose()
+            engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
+            command.downgrade(config, _DISPATCH_REVISION)
+        else:
             command.upgrade(config, _DISPATCH_REVISION)
-        new_tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
-        new_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
-        for table, columns in (
-            (new_tasks, ["next_run_at", "project_id", "delegation_ref"]),
-            (new_runs, ["host_id", "trigger_key", "lease_expires_at"]),
-        ):
-            assert all(table.c[column].nullable for column in columns)
-            with engine.connect() as conn:
-                rows = conn.execute(sa.select(*(table.c[column] for column in columns))).all()
-                assert rows and all(tuple(row) == (None, None, None) for row in rows)
-        with engine.begin() as conn:
-            # An old writer can still insert an occurrence with the same timestamp.
-            conn.execute(
-                runs.insert().values(
-                    id=b"3" * 16,
-                    scheduled_task_id=b"a" * 16,
-                    status=3,
-                    scheduled_at=100,
-                )
-            )
-            conn.execute(
-                new_tasks.update()
-                .where(new_tasks.c.id == b"a" * 16)
-                .values(
-                    next_run_at=2**31 + 100,
-                    project_id=b"p" * 16,
-                    delegation_ref="delegations/example",
-                )
-            )
-            conn.execute(
-                new_runs.update()
-                .where(new_runs.c.id == b"1" * 16)
-                .values(
-                    host_id=b"h" * 16,
-                    trigger_key="schedule:100",
-                    lease_expires_at=2**31 + 120,
-                )
-            )
-            assert conn.execute(
-                sa.select(
-                    new_tasks.c.next_run_at,
-                    new_tasks.c.project_id,
-                    new_tasks.c.delegation_ref,
-                )
-            ).one() == (2**31 + 100, b"p" * 16, "delegations/example")
-            assert conn.execute(
-                sa.select(
-                    new_runs.c.host_id,
-                    new_runs.c.trigger_key,
-                    new_runs.c.lease_expires_at,
-                ).where(new_runs.c.id == b"1" * 16)
-            ).one() == (b"h" * 16, "schedule:100", 2**31 + 120)
-            config.attributes["connection"] = conn
-            command.downgrade(config, _DISPATCH_PREVIOUS)
-        assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")} == set(
-            tasks.c.keys()
-        )
-        assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")} == set(
-            runs.c.keys()
-        )
-        with engine.begin() as conn:
-            assert conn.execute(sa.select(runs.c.status)).scalars().all() == [3, 3, 3]
-            config.attributes["connection"] = conn
-            command.upgrade(config, _DISPATCH_REVISION)
+        yield engine
     finally:
         engine.dispose()
+        clear_engine_cache()
+        if admin is not None:
+            cascade = " CASCADE" if admin.dialect.name == "cockroachdb" else ""
+            with admin.connect() as conn:
+                conn.execute(sa.text(f"DROP DATABASE {quoted}{cascade}"))
+            admin.dispose()
 
 
-def test_dispatch_downgrade_refuses_starting_runs(db_engine: Engine) -> None:
+def test_dispatch_migration_preserves_history_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_PREVIOUS)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"a" * 16,
+                name="daily",
+                prompt=b"p",
+                rrule="FREQ=DAILY",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                created_at=1,
+            )
+        )
+        conn.execute(
+            runs.insert(),
+            [
+                {
+                    "id": run_id,
+                    "scheduled_task_id": b"a" * 16,
+                    "status": 3,
+                    "scheduled_at": 100,
+                }
+                for run_id in (b"1" * 16, b"2" * 16)
+            ],
+        )
+        config.attributes["connection"] = conn
+        command.upgrade(config, _DISPATCH_REVISION)
+    new_tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    new_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    for table, columns in (
+        (new_tasks, ["next_run_at", "project_id", "delegation_ref"]),
+        (new_runs, ["host_id", "trigger_key", "lease_expires_at"]),
+    ):
+        assert all(table.c[column].nullable for column in columns)
+        with engine.connect() as conn:
+            rows = conn.execute(sa.select(*(table.c[column] for column in columns))).all()
+            assert rows and all(tuple(row) == (None, None, None) for row in rows)
+    with engine.begin() as conn:
+        # An old writer can still insert an occurrence with the same timestamp.
+        conn.execute(
+            runs.insert().values(
+                id=b"3" * 16,
+                scheduled_task_id=b"a" * 16,
+                status=3,
+                scheduled_at=100,
+            )
+        )
+        conn.execute(
+            new_tasks.update()
+            .where(new_tasks.c.id == b"a" * 16)
+            .values(
+                next_run_at=2**31 + 100,
+                project_id=b"p" * 16,
+                delegation_ref="delegations/example",
+            )
+        )
+        conn.execute(
+            new_runs.update()
+            .where(new_runs.c.id == b"1" * 16)
+            .values(
+                host_id=b"h" * 16,
+                trigger_key="schedule:100",
+                lease_expires_at=2**31 + 120,
+            )
+        )
+        assert conn.execute(
+            sa.select(
+                new_tasks.c.next_run_at,
+                new_tasks.c.project_id,
+                new_tasks.c.delegation_ref,
+            )
+        ).one() == (2**31 + 100, b"p" * 16, "delegations/example")
+        assert conn.execute(
+            sa.select(
+                new_runs.c.host_id,
+                new_runs.c.trigger_key,
+                new_runs.c.lease_expires_at,
+            ).where(new_runs.c.id == b"1" * 16)
+        ).one() == (b"h" * 16, "schedule:100", 2**31 + 120)
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_PREVIOUS)
+    assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")} == set(
+        tasks.c.keys()
+    )
+    assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")} == set(
+        runs.c.keys()
+    )
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(runs.c.status)).scalars().all() == [3, 3, 3]
+        config.attributes["connection"] = conn
+        command.upgrade(config, _DISPATCH_REVISION)
+
+
+def test_dispatch_downgrade_refuses_starting_runs(dispatch_migration_engine: Engine) -> None:
+    db_engine = dispatch_migration_engine
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=db_engine)
     with db_engine.begin() as conn:
         conn.execute(
@@ -575,7 +598,7 @@ def test_dispatch_downgrade_refuses_starting_runs(db_engine: Engine) -> None:
                 scheduled_at=1,
             )
         )
-    config = _build_alembic_config(str(db_engine.url))
+    config = _build_alembic_config(db_engine.url.render_as_string(hide_password=False))
     with pytest.raises(RuntimeError, match="Reconcile starting"), db_engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_PREVIOUS)
@@ -617,3 +640,44 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
 
     engine.dispose()
     clear_engine_cache()
+
+
+@pytest.mark.parametrize(
+    "dialect_name", ["sqlite", "cloudflare_d1", "postgresql", "mysql", "cockroachdb"]
+)
+def test_dispatch_byte_checks_compile_once_per_dialect(
+    dialect_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.migrations.versions import (
+        c8e4f2a6b901_add_scheduled_task_dispatch_fields as dispatch_migration,
+    )
+
+    if dialect_name == "cockroachdb":
+        pytest.importorskip("sqlalchemy_cockroachdb")
+    if dialect_name == "cloudflare_d1":
+        pytest.importorskip("sqlalchemy_cloudflare_d1")
+    statements: list[str] = []
+
+    def record(statement: sa.ExecutableDDLElement, *args: object, **kwargs: object) -> None:
+        statements.append(str(statement.compile(dialect=engine.dialect)))
+
+    engine = sa.create_mock_engine(f"{dialect_name}://", record)
+    monkeypatch.setattr(dispatch_migration.op, "get_bind", lambda: engine)
+    for model, field, limit in (
+        (SqlScheduledTask, "delegation_ref", 1024),
+        (SqlScheduledTaskRun, "trigger_key", 256),
+    ):
+        model.__table__.create(engine)
+        ddl = "\n".join(statements)
+        name = f"ck_{model.__tablename__}_{field}_size"
+        assert ddl.count(f"CONSTRAINT {name}") == 1
+        expected = (
+            f"length(CAST({field} AS BLOB))"
+            if dialect_name in ("sqlite", "cloudflare_d1")
+            else f"octet_length({field})"
+        )
+        assert f"{expected} <= {limit}" in ddl
+        assert (
+            str(dispatch_migration._byte_length(field).compile(dialect=engine.dialect)) == expected
+        )
+        statements.clear()

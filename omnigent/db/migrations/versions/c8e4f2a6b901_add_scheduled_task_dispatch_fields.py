@@ -1,26 +1,11 @@
-"""Add persistence for scheduled-task dispatch.
+"""Add nullable scheduled-task dispatch fields.
 
 Revision ID: c8e4f2a6b901
 Revises: nf12ab34cd56
 
-Deploy before the scheduler/fire-path changes. All six columns are nullable:
-existing tasks need next-run initialization, historical runs have no reliable
-trigger identity, and old writers must continue to work. NULL trigger keys do
-not participate in occurrence deduplication; new claim writers must supply one.
-Timestamps are UTC epoch seconds stored as BIGINT. The two scan indexes end
-with the full primary key for bounded, deterministic cross-workspace paging.
-
-Delegation references are bounded to 1,024 UTF-8 bytes and trigger keys to 256
-UTF-8 bytes, including their namespace. Trigger keys use case-sensitive MySQL
-comparison; callers must generate canonical keys without trailing whitespace.
-Status 6 is reserved for starting; codes 1-5 retain their existing meanings.
-Application codecs, stores, and API changes ship separately; do not write
-status 6 until all readers support it. No scheduling or dispatch is enabled here.
-
-Rollback: stop new writers and reconcile all starting runs before downgrading.
-Downgrade refuses while status 6 exists and otherwise discards the new fields;
-back up populated fields before a schema rollback. Older binaries reject an
-unknown Alembic revision, so application rollback also needs schema compatibility.
+Deploy before consumers; reserve status 6 until all readers support starting.
+Downgrade requires stopping new writers and reconciling starting runs, and
+otherwise discards the new fields. Older binaries require a compatible revision.
 """
 
 from __future__ import annotations
@@ -41,6 +26,9 @@ def _byte_length(column: str) -> sa.ColumnElement:
     value = sa.column(column)
     if op.get_bind().dialect.name == "sqlite":
         return sa.func.length(sa.cast(value, sa.LargeBinary()))
+    if op.get_bind().dialect.name == "cloudflare_d1":
+        # D1 compiles LargeBinary as TEXT; BLOB is required to count UTF-8 bytes.
+        return sa.literal_column(f"length(CAST({column} AS BLOB))")
     return sa.func.octet_length(value)
 
 
@@ -52,9 +40,6 @@ def upgrade() -> None:
         batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
         batch.create_check_constraint(
             "ck_scheduled_tasks_delegation_ref_size", _byte_length("delegation_ref") <= 1024
-        )
-        batch.create_check_constraint(
-            "ck_scheduled_tasks_project_id_size", _byte_length("project_id") == 16
         )
         batch.create_index(
             "ix_scheduled_tasks_due", ["state", "next_run_at", "workspace_id", "id"]
@@ -74,9 +59,6 @@ def upgrade() -> None:
         batch.add_column(sa.Column("lease_expires_at", sa.BigInteger(), nullable=True))
         batch.create_check_constraint(
             "ck_scheduled_task_runs_trigger_key_size", _byte_length("trigger_key") <= 256
-        )
-        batch.create_check_constraint(
-            "ck_scheduled_task_runs_host_id_size", _byte_length("host_id") == 16
         )
         # A distinct name lets CockroachDB replace the check in one transaction.
         batch.drop_constraint("ck_scheduled_task_runs_status", type_="check")
@@ -109,7 +91,6 @@ def downgrade() -> None:
         batch.drop_constraint("ck_scheduled_task_runs_dispatch_status", type_="check")
         batch.create_check_constraint("ck_scheduled_task_runs_status", "status IN (1, 2, 3, 4, 5)")
         batch.drop_constraint("ck_scheduled_task_runs_trigger_key_size", type_="check")
-        batch.drop_constraint("ck_scheduled_task_runs_host_id_size", type_="check")
         batch.drop_column("lease_expires_at")
         batch.drop_column("host_id")
         batch.drop_column("trigger_key")
@@ -117,7 +98,6 @@ def downgrade() -> None:
     with op.batch_alter_table("scheduled_tasks") as batch:
         batch.drop_index("ix_scheduled_tasks_due")
         batch.drop_constraint("ck_scheduled_tasks_delegation_ref_size", type_="check")
-        batch.drop_constraint("ck_scheduled_tasks_project_id_size", type_="check")
         batch.drop_column("delegation_ref")
         batch.drop_column("project_id")
         batch.drop_column("next_run_at")
