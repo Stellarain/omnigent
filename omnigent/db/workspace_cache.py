@@ -73,10 +73,11 @@ class WorkspaceScopedCache(Generic[K, V]):
         :param factory: Produces the backing mapping.
         :param reset_on_error: For pure caches only. When ``True``, a
             failure raised by the backing mapping in :meth:`get`, ``in``,
-            ``pop(key, default)`` or assignment is logged, the backing
-            mapping is replaced with a fresh one, and the call degrades to
-            a miss / no-op so callers fall back to their source of truth
-            instead of failing until restart.
+            ``pop(key, default)``, :meth:`setdefault`, :meth:`update` or
+            assignment is logged, the backing mapping is replaced with a
+            fresh one, and the call degrades to a miss / no-op so callers
+            fall back to their source of truth instead of failing until
+            restart.
         """
         self._factory = factory
         self._backing: MutableMapping[tuple[int, K], V] = factory()
@@ -151,14 +152,25 @@ class WorkspaceScopedCache(Generic[K, V]):
     def setdefault(self, key: K, default: V) -> V:
         scoped = self._scoped(key)
         with self._lock:
-            return self._backing.setdefault(scoped, default)
+            try:
+                return self._backing.setdefault(scoped, default)
+            except Exception as error:
+                if not self._reset_on_error:
+                    raise
+                self._reset_after_error("setdefault", error)
+                return default
 
     def update(self, other: Mapping[K, V]) -> None:
         """Merge *other*'s entries into the current workspace's slice."""
         ws = current_workspace_id()
         with self._lock:
-            for key, value in other.items():
-                self._backing[(ws, key)] = value
+            try:
+                for key, value in other.items():
+                    self._backing[(ws, key)] = value
+            except Exception as error:
+                if not self._reset_on_error:
+                    raise
+                self._reset_after_error("update", error)
 
     @overload
     def pop(self, key: K) -> V:

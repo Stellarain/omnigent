@@ -285,3 +285,63 @@ def test_backing_errors_propagate_without_reset_on_error() -> None:
     cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache(_CorruptedTTLCache)
     with pytest.raises(KeyError):
         cache["k"] = 1
+
+
+class _RaisingMapping(dict[Any, Any]):
+    """Backing mapping whose reads and writes raise a non-``KeyError`` failure."""
+
+    def __contains__(self, key: object) -> bool:
+        raise RuntimeError("corrupted backing")
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        raise RuntimeError("corrupted backing")
+
+    def pop(self, key: Any, default: Any = None) -> Any:
+        raise RuntimeError("corrupted backing")
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        raise RuntimeError("corrupted backing")
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        raise RuntimeError("corrupted backing")
+
+
+_FALLIBLE_OPERATIONS: dict[str, tuple[Any, Any]] = {
+    "get": (lambda cache: cache.get("k", "miss"), "miss"),
+    "contains": (lambda cache: "k" in cache, False),
+    "pop": (lambda cache: cache.pop("k", "miss"), "miss"),
+    "setdefault": (lambda cache: cache.setdefault("k", 7), 7),
+    "update": (lambda cache: cache.update({"k": 7}), None),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(_FALLIBLE_OPERATIONS))
+def test_reset_on_error_recovers_each_operation(
+    operation: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each guarded operation degrades to a miss, logs, and swaps the backing."""
+    call, expected = _FALLIBLE_OPERATIONS[operation]
+    cache: WorkspaceScopedCache[str, Any] = WorkspaceScopedCache(reset_on_error=True)
+    corrupted = _RaisingMapping()
+    cache._backing = corrupted
+
+    with caplog.at_level("WARNING", logger="omnigent.db.workspace_cache"):
+        assert call(cache) == expected
+
+    assert f"after {operation} failed" in caplog.text
+    assert cache._backing is not corrupted
+    cache["k"] = 1
+    assert cache.get("k") == 1
+
+
+@pytest.mark.parametrize("operation", sorted(_FALLIBLE_OPERATIONS))
+def test_operation_errors_propagate_without_reset_on_error(operation: str) -> None:
+    """Without the opt-in, backing failures surface and the backing is kept."""
+    call, _expected = _FALLIBLE_OPERATIONS[operation]
+    cache: WorkspaceScopedCache[str, Any] = WorkspaceScopedCache()
+    corrupted = _RaisingMapping()
+    cache._backing = corrupted
+
+    with pytest.raises(RuntimeError, match="corrupted backing"):
+        call(cache)
+    assert cache._backing is corrupted

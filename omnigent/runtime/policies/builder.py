@@ -1762,8 +1762,9 @@ def invalidate_default_policy_specs_cache() -> None:
 
     Call this after any mutation (create, update, delete) of a default
     policy so the next :func:`build_policy_engine` call re-reads from the
-    DB rather than serving a stale TTL entry. Scoped to the current
-    workspace context via :func:`~omnigent.db.db_models.current_workspace_id`.
+    DB rather than serving a stale TTL entry. The workspace-scoped cache
+    supplies the current workspace and serializes access; if its backing
+    store is corrupted it resets itself, so eviction never raises.
     """
     _DEFAULT_POLICY_SPECS_CACHE.pop(_DEFAULT_POLICY_SPECS_KEY, None)
 
@@ -1774,7 +1775,9 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
 
     Call this after any mutation (create, update, delete) of a session
     policy so the next :func:`build_policy_engine` call re-reads from
-    the DB. Scoped to the current workspace context.
+    the DB. Scoped to the current workspace context; like the default
+    cache, access is serialized and a corrupted backing store resets
+    itself instead of raising.
 
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
