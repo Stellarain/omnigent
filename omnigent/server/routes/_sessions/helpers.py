@@ -27,6 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -204,6 +205,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
     _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
+    _MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
     _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MAX_TERMINAL_LAUNCH_ARGS,
     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
@@ -299,7 +301,7 @@ from omnigent.server.schemas import (
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
-from omnigent.server.startup_inputs import StartupInputContext
+from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -2128,9 +2130,9 @@ def _utc_day(epoch_seconds: int) -> str:
     :param epoch_seconds: Unix epoch seconds, e.g. ``1749081600``.
     :returns: The UTC date as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).date().isoformat()
+    return datetime.fromtimestamp(epoch_seconds, tz=UTC).date().isoformat()
 
 
 def _record_daily_cost(
@@ -5715,7 +5717,7 @@ async def _query_host_runner_status(
             future,
             timeout=_facade._HOST_RUNNER_STATUS_TIMEOUT_S,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return None
     except Exception:  # noqa: BLE001
         # Defensive: this query only ever *speeds up* the connect grace, so
@@ -6255,7 +6257,7 @@ async def _launch_runner_on_host_locked(
                 launch_future,
                 timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
@@ -6297,6 +6299,71 @@ async def _launch_runner_on_host_locked(
                 error=result.get("error"),
             )
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
+
+
+def _start_managed_launch_task(
+    session_id: str,
+    launch: Coroutine[Any, Any, None],
+    *,
+    conversation_store: ConversationStore,
+    tracker: ManagedLaunchTracker,
+    startup: ManagedStartupInputs | None,
+) -> asyncio.Task[None]:
+    """
+    Run a managed launch in the background, failing saved inputs it can't deliver.
+
+    The task is tracked so shutdown lets it bind its host before cancelling it;
+    *launch* must run inside this task because the bind step untracks the
+    current task.
+
+    :param session_id: The session the launch provisions a sandbox for.
+    :param launch: The :func:`_run_managed_launch` coroutine (or a wrapper
+        that awaits it).
+    :param conversation_store: Store holding the session row.
+    :param tracker: The app's launch tracker; a settled failure is read here.
+    :param startup: The server's saved-input service, or ``None`` when the
+        server has none.
+    :returns: The launch task.
+    """
+
+    async def record_unbound_launch_failure() -> None:
+        # Shutdown gave up on the launch. Bound, the host's replica finishes
+        # it; unbound, no replica can, so fail the saved inputs rather than
+        # leave them pending with nothing to deliver them.
+        assert startup is not None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is not None and conv.host_id is None:
+            await startup.record_launch_failure(
+                session_id, "the server shut down before the sandbox finished launching"
+            )
+
+    async def launch_and_record_failure() -> None:
+        try:
+            await launch
+        except asyncio.CancelledError:
+            if startup is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        record_unbound_launch_failure(),
+                        timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
+                    )
+            raise
+        except Exception as exc:
+            if startup is not None:
+                await startup.record_launch_failure(
+                    session_id, f"managed sandbox failed to launch: {exc}"
+                )
+            raise
+        failed = tracker.get(session_id)
+        if startup is not None and failed is not None and failed.error is not None:
+            await startup.record_launch_failure(session_id, failed.error)
+
+    launch_task = asyncio.create_task(launch_and_record_failure())
+    _managed_launch_tasks.add(launch_task)
+    _unbound_managed_launch_tasks.add(launch_task)
+    launch_task.add_done_callback(_managed_launch_tasks.discard)
+    launch_task.add_done_callback(_unbound_managed_launch_tasks.discard)
+    return launch_task
 
 
 async def cancel_managed_launch_tasks(drain_s: float = 0.0) -> None:
@@ -6509,7 +6576,7 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
             launch.settled.wait(),
             timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise OmnigentError(
             "The session's managed sandbox is still provisioning; try again shortly",
             code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -7334,7 +7401,7 @@ async def _stop_session_host_runner(
                 future,
                 timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _logger.warning(
                 "Host %s did not acknowledge stop of runner %s for session %s",
                 host_id,
@@ -12162,6 +12229,7 @@ __all__ = [
     "_signal_terminal_resolved_harness_elicitation",
     "_spec_config_flag_explicitly_disabled",
     "_spec_harness",
+    "_start_managed_launch_task",
     "_stop_session_host_runner",
     "_stop_session_via_runner",
     "_stored_file_to_resource",

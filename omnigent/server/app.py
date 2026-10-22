@@ -1804,6 +1804,7 @@ def create_app(
                 # (before this lifespan runs), so it is already on state here.
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
+                startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
@@ -1994,6 +1995,27 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
+    # Managed-sandbox owner identity: a launcher that acts as the host's owner
+    # (e.g. the `databricks` provider) resolves that user's
+    # connected credential through these, keyed by connection provider.
+    if sandbox_config is not None:
+        from dataclasses import replace as _dc_replace
+
+        from omnigent.server.connections_registry import blocking_owner_resolver
+
+        _owner_credentials = {
+            _provider.name: blocking_owner_resolver(
+                _provider.owner_identity_resolver,
+                store=getattr(app.state, f"{_provider.name}_store"),
+                client=getattr(app.state, f"{_provider.name}_client"),
+            )
+            for _provider in connection_providers()
+            if _provider.owner_identity_resolver is not None
+            and getattr(app.state, f"{_provider.name}_store", None) is not None
+        }
+        if _owner_credentials:
+            sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
+            app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
