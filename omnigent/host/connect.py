@@ -439,9 +439,7 @@ def _connection_refused(exc: BaseException) -> bool:
     :returns: ``True`` for a connection-refused failure, ``False``
         otherwise (fail toward "not refused" — the loop keeps retrying).
     """
-    # BaseExceptionGroup is a 3.11+ builtin (we require 3.12); ruff's pinned
-    # py310 target misflags it as undefined.
-    if isinstance(exc, BaseExceptionGroup):  # noqa: F821
+    if isinstance(exc, BaseExceptionGroup):
         return all(_connection_refused(sub) for sub in exc.exceptions)
     if not isinstance(exc, OSError):
         return False
@@ -637,6 +635,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
         "OMNIGENT_CLAUDE_LAUNCHER",
+        # claude-sdk executor reads this and forwards it as CLAUDE_CODE_ENTRYPOINT;
+        # the daemon→runner strip would otherwise drop it. Not a secret.
+        "OMNIGENT_CLAUDE_CODE_ENTRYPOINT",
+        # Claude-family background-title model override (a model alias). Not a secret.
+        "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
@@ -731,6 +734,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Path (not a secret) to the launcher-refreshed front-door bearer, and
+        # the only server it may be sent to.
+        "OMNIGENT_PROXY_BEARER_FILE",
+        "OMNIGENT_PROXY_BEARER_SERVER_URL",
         # The outer sandbox hint must survive both daemon and runner filtering.
         "OMNIGENT_HOST_SANDBOX_BACKEND",
         # Executable selection must survive CLI -> daemon -> runner. The
@@ -4696,6 +4703,14 @@ class HostProcess:
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
+            # Behind an authenticating front door (Databricks Apps OAuth proxy)
+            # the launch token alone never reaches the server; the launcher-
+            # provisioned proxy bearer gets the request through the proxy.
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            proxy_bearer = read_proxy_bearer(self._server_url)
+            if proxy_bearer:
+                headers["Authorization"] = f"Bearer {proxy_bearer}"
             return headers
         token = self._current_auth_token()
         if token:
@@ -4718,7 +4733,9 @@ class HostProcess:
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
         if os.environ.get(HOST_TOKEN_ENV_VAR):
-            return None
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            return read_proxy_bearer(self._server_url)
         try:
             if not self._auth_token_factory_resolved:
                 if not initialize:
