@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -465,6 +466,20 @@ def test_dispatch_migration_preserves_history_and_round_trips(
     with engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_PREVIOUS)
+    if engine.dialect.name == "cockroachdb":
+        with engine.begin() as conn:
+            # Existing databases may have been created with default_int_size=4.
+            for table_name, fields in (
+                ("scheduled_tasks", ("created_at", "last_run_at", "updated_at")),
+                ("scheduled_task_runs", ("scheduled_at", "fired_at", "finished_at")),
+            ):
+                # Recreate empty tables because CRDB cannot narrow indexed columns.
+                ddl = conn.execute(sa.text(f"SHOW CREATE TABLE {table_name}")).one()[1]
+                for field in fields:
+                    assert f"{field} INT8" in ddl
+                    ddl = ddl.replace(f"{field} INT8", f"{field} INT4")
+                conn.execute(sa.text(f"DROP TABLE {table_name}"))
+                conn.execute(sa.text(ddl))
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
     with engine.begin() as conn:
@@ -636,6 +651,15 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
             assert "trigger_key" in {
                 c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")
             }
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql", "cockroachdb"])
+def test_dispatch_downgrade_requires_live_connection(dialect: str) -> None:
+    config = _build_alembic_config(f"{dialect}://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_DISPATCH_REVISION}:{_DISPATCH_PREVIOUS}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
 
 
 def test_dispatch_downgrade_refuses_starting_runs(dispatch_migration_engine: Engine) -> None:

@@ -12,7 +12,7 @@ binaries require a compatible revision.
 from __future__ import annotations
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 from sqlalchemy.dialects.mysql import VARCHAR
 
 from omnigent.db.db_models import Uuid16
@@ -30,15 +30,13 @@ _RUN_TIMESTAMPS = ("scheduled_at", "fired_at", "finished_at")
 def upgrade() -> None:
     """Widen timestamps and add dispatch fields, uniqueness, and scan indexes."""
     with op.batch_alter_table("scheduled_tasks") as batch:
-        # CockroachDB's existing INTEGER timestamps are already 64-bit.
-        if op.get_bind().dialect.name != "cockroachdb":
-            for column in _TASK_TIMESTAMPS:
-                batch.alter_column(
-                    column,
-                    existing_type=sa.Integer(),
-                    type_=sa.BigInteger(),
-                    existing_nullable=column != "created_at",
-                )
+        for column in _TASK_TIMESTAMPS:
+            batch.alter_column(
+                column,
+                existing_type=sa.Integer(),
+                type_=sa.BigInteger(),
+                existing_nullable=column != "created_at",
+            )
         batch.add_column(sa.Column("next_run_at", sa.BigInteger(), nullable=True))
         batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
@@ -47,15 +45,13 @@ def upgrade() -> None:
         )
 
     with op.batch_alter_table("scheduled_task_runs") as batch:
-        # CockroachDB's existing INTEGER timestamps are already 64-bit.
-        if op.get_bind().dialect.name != "cockroachdb":
-            for column in _RUN_TIMESTAMPS:
-                batch.alter_column(
-                    column,
-                    existing_type=sa.Integer(),
-                    type_=sa.BigInteger(),
-                    existing_nullable=column != "scheduled_at",
-                )
+        for column in _RUN_TIMESTAMPS:
+            batch.alter_column(
+                column,
+                existing_type=sa.Integer(),
+                type_=sa.BigInteger(),
+                existing_nullable=column != "scheduled_at",
+            )
         batch.add_column(
             sa.Column(
                 "trigger_key",
@@ -84,6 +80,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Restore the previous schema only when statuses and timestamps fit."""
+    if context.is_offline_mode():
+        raise RuntimeError(
+            "Downgrade requires a live connection to check run statuses and timestamps"
+        )
     runs = sa.table("scheduled_task_runs", sa.column("status"))
     if op.get_bind().execute(sa.select(runs.c.status).where(runs.c.status == 6).limit(1)).first():
         raise RuntimeError("Reconcile starting scheduled-task runs before downgrading")
@@ -115,6 +115,7 @@ def downgrade() -> None:
         batch.drop_column("lease_expires_at")
         batch.drop_column("host_id")
         batch.drop_column("trigger_key")
+        # CRDB cannot narrow indexed timestamps; keep their widened types.
         if op.get_bind().dialect.name != "cockroachdb":
             for column in _RUN_TIMESTAMPS:
                 batch.alter_column(
@@ -129,6 +130,7 @@ def downgrade() -> None:
         batch.drop_column("delegation_ref")
         batch.drop_column("project_id")
         batch.drop_column("next_run_at")
+        # CRDB cannot narrow indexed timestamps; keep their widened types.
         if op.get_bind().dialect.name != "cockroachdb":
             for column in _TASK_TIMESTAMPS:
                 batch.alter_column(
