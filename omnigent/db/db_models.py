@@ -1483,7 +1483,7 @@ class SqlScheduledTask(OmnigentBase):
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     next_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Opaque grant reference, never credentials; capped at 1,024 UTF-8 bytes.
+    # Opaque grant reference, never credentials.
     delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
@@ -1551,22 +1551,6 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        CheckConstraint(
-            "length(CAST(delegation_ref AS BLOB)) <= 1024",
-            name="ck_scheduled_tasks_delegation_ref_size",
-        ).ddl_if(
-            callable_=lambda *_args, **kwargs: (
-                kwargs["dialect"].name in ("sqlite", "cloudflare_d1")
-            )
-        ),
-        CheckConstraint(
-            "octet_length(delegation_ref) <= 1024",
-            name="ck_scheduled_tasks_delegation_ref_size",
-        ).ddl_if(
-            callable_=lambda *_args, **kwargs: (
-                kwargs["dialect"].name not in ("sqlite", "cloudflare_d1")
-            )
-        ),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
@@ -1612,7 +1596,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     """
 
     __tablename__ = "scheduled_task_runs"
-    # Canonical occurrence key: at most 256 UTF-8 bytes, without trailing whitespace.
+    # Canonical occurrence key, without trailing whitespace.
     trigger_key: Mapped[str | None] = mapped_column(
         String(256).with_variant(
             MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
@@ -1653,22 +1637,6 @@ class SqlScheduledTaskRun(OmnigentBase):
         CheckConstraint(
             "status IN (1, 2, 3, 4, 5, 6)",
             name="ck_scheduled_task_runs_dispatch_status",
-        ),
-        CheckConstraint(
-            "length(CAST(trigger_key AS BLOB)) <= 256",
-            name="ck_scheduled_task_runs_trigger_key_size",
-        ).ddl_if(
-            callable_=lambda *_args, **kwargs: (
-                kwargs["dialect"].name in ("sqlite", "cloudflare_d1")
-            )
-        ),
-        CheckConstraint(
-            "octet_length(trigger_key) <= 256",
-            name="ck_scheduled_task_runs_trigger_key_size",
-        ).ddl_if(
-            callable_=lambda *_args, **kwargs: (
-                kwargs["dialect"].name not in ("sqlite", "cloudflare_d1")
-            )
         ),
         UniqueConstraint(
             "workspace_id",

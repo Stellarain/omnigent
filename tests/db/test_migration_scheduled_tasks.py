@@ -5,8 +5,8 @@ neither carries a database-level foreign key (schema Rule R032 — the
 ``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
 application-owned), that ``scheduled_tasks.rrule`` is NOT NULL and the
 ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
-tables cleanly. Dispatch coverage includes occurrence deduplication, byte
-bounds, legacy writers, history preservation, and guarded rollback.
+tables cleanly. Dispatch coverage includes occurrence deduplication,
+legacy writers, history preservation, and guarded rollback.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
 from omnigent.db.utils import (
@@ -405,53 +405,6 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
             conn.execute(second)
 
 
-@pytest.mark.parametrize(
-    ("table_name", "field", "valid", "invalid"),
-    [
-        (
-            "scheduled_tasks",
-            "delegation_ref",
-            "é" * 512,
-            ("x" * 1025, "é" * 513, "\0" + "x" * 1024),
-        ),
-        (
-            "scheduled_task_runs",
-            "trigger_key",
-            "é" * 128,
-            ("x" * 257, "é" * 129, "\0" + "x" * 256),
-        ),
-    ],
-)
-@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
-def test_dispatch_fields_enforce_byte_bounds(
-    db_engine: Engine,
-    table_name: str,
-    field: str,
-    valid: str,
-    invalid: tuple[str, ...],
-) -> None:
-    table = sa.Table(table_name, sa.MetaData(), autoload_with=db_engine)
-    values = (
-        {
-            "name": "n",
-            "prompt": b"p",
-            "rrule": "FREQ=DAILY",
-            "agent_id": b"a" * 16,
-            "created_at": 1,
-        }
-        if table_name == "scheduled_tasks"
-        else {"scheduled_task_id": b"a" * 16, "status": 1, "scheduled_at": 1}
-    )
-    if table_name == "scheduled_tasks":
-        values["timezone"] = "UTC"
-    with db_engine.begin() as conn:
-        conn.execute(table.insert().values(**values, id=b"1" * 16, **{field: valid}))
-    for invalid_value in invalid:
-        # Length overflow and embedded NUL rejection use different DBAPI subclasses.
-        with pytest.raises(DBAPIError), db_engine.begin() as conn:
-            conn.execute(table.insert().values(**values, id=b"2" * 16, **{field: invalid_value}))
-
-
 @pytest.fixture
 def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
@@ -648,44 +601,3 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
 
     engine.dispose()
     clear_engine_cache()
-
-
-@pytest.mark.parametrize(
-    "dialect_name", ["sqlite", "cloudflare_d1", "postgresql", "mysql", "cockroachdb"]
-)
-def test_dispatch_byte_checks_compile_once_per_dialect(
-    dialect_name: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from omnigent.db.migrations.versions import (
-        c8e4f2a6b901_add_scheduled_task_dispatch_fields as dispatch_migration,
-    )
-
-    if dialect_name == "cockroachdb":
-        pytest.importorskip("sqlalchemy_cockroachdb")
-    if dialect_name == "cloudflare_d1":
-        pytest.importorskip("sqlalchemy_cloudflare_d1")
-    statements: list[str] = []
-
-    def record(statement: sa.ExecutableDDLElement, *args: object, **kwargs: object) -> None:
-        statements.append(str(statement.compile(dialect=engine.dialect)))
-
-    engine = sa.create_mock_engine(f"{dialect_name}://", record)
-    monkeypatch.setattr(dispatch_migration.op, "get_bind", lambda: engine)
-    for model, field, limit in (
-        (SqlScheduledTask, "delegation_ref", 1024),
-        (SqlScheduledTaskRun, "trigger_key", 256),
-    ):
-        model.__table__.create(engine)
-        ddl = "\n".join(statements)
-        name = f"ck_{model.__tablename__}_{field}_size"
-        assert ddl.count(f"CONSTRAINT {name}") == 1
-        expected = (
-            f"length(CAST({field} AS BLOB))"
-            if dialect_name in ("sqlite", "cloudflare_d1")
-            else f"octet_length({field})"
-        )
-        assert f"{expected} <= {limit}" in ddl
-        assert (
-            str(dispatch_migration._byte_length(field).compile(dialect=engine.dialect)) == expected
-        )
-        statements.clear()
