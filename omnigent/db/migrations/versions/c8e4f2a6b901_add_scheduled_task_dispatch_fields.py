@@ -1,11 +1,12 @@
-"""Add nullable scheduled-task dispatch fields.
+"""Add scheduled-task dispatch fields and widen existing timestamps.
 
 Revision ID: c8e4f2a6b901
 Revises: nf12ab34cd56
 
 Deploy before consumers; reserve status 6 until all readers support starting.
-Downgrade requires stopping new writers and reconciling starting runs, and
-otherwise discards the new fields. Older binaries require a compatible revision.
+Downgrade requires stopping new writers, reconciling starting runs, and fitting
+legacy timestamps into signed 32-bit integers. It discards new fields. Older
+binaries require a compatible revision.
 """
 
 from __future__ import annotations
@@ -22,9 +23,22 @@ branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
 
+_TASK_TIMESTAMPS = ("last_run_at", "created_at", "updated_at")
+_RUN_TIMESTAMPS = ("scheduled_at", "fired_at", "finished_at")
+
+
 def upgrade() -> None:
-    """Add nullable dispatch fields, occurrence uniqueness, and scan indexes."""
+    """Widen timestamps and add dispatch fields, uniqueness, and scan indexes."""
     with op.batch_alter_table("scheduled_tasks") as batch:
+        # CockroachDB's existing INTEGER timestamps are already 64-bit.
+        if op.get_bind().dialect.name != "cockroachdb":
+            for column in _TASK_TIMESTAMPS:
+                batch.alter_column(
+                    column,
+                    existing_type=sa.Integer(),
+                    type_=sa.BigInteger(),
+                    existing_nullable=column != "created_at",
+                )
         batch.add_column(sa.Column("next_run_at", sa.BigInteger(), nullable=True))
         batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
@@ -33,6 +47,15 @@ def upgrade() -> None:
         )
 
     with op.batch_alter_table("scheduled_task_runs") as batch:
+        # CockroachDB's existing INTEGER timestamps are already 64-bit.
+        if op.get_bind().dialect.name != "cockroachdb":
+            for column in _RUN_TIMESTAMPS:
+                batch.alter_column(
+                    column,
+                    existing_type=sa.Integer(),
+                    type_=sa.BigInteger(),
+                    existing_nullable=column != "scheduled_at",
+                )
         batch.add_column(
             sa.Column(
                 "trigger_key",
@@ -60,10 +83,25 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Restore the previous schema only after starting runs have been reconciled."""
+    """Restore the previous schema only when statuses and timestamps fit."""
     runs = sa.table("scheduled_task_runs", sa.column("status"))
     if op.get_bind().execute(sa.select(runs.c.status).where(runs.c.status == 6).limit(1)).first():
         raise RuntimeError("Reconcile starting scheduled-task runs before downgrading")
+
+    # Check both tables before DDL, including on engines with nontransactional DDL.
+    for table_name, columns in (
+        ("scheduled_tasks", _TASK_TIMESTAMPS),
+        ("scheduled_task_runs", _RUN_TIMESTAMPS),
+    ):
+        table = sa.table(table_name, *(sa.column(column) for column in columns))
+        outside_range = sa.or_(
+            *(sa.or_(column < -(2**31), column > 2**31 - 1) for column in table.c)
+        )
+        if op.get_bind().execute(sa.select(table).where(outside_range).limit(1)).first():
+            raise RuntimeError(
+                f"Reconcile timestamps outside signed 32-bit range in {table_name} "
+                "before downgrading"
+            )
 
     with op.batch_alter_table("scheduled_task_runs") as batch:
         batch.drop_index("ix_scheduled_task_runs_expired_claims")
@@ -77,9 +115,25 @@ def downgrade() -> None:
         batch.drop_column("lease_expires_at")
         batch.drop_column("host_id")
         batch.drop_column("trigger_key")
+        if op.get_bind().dialect.name != "cockroachdb":
+            for column in _RUN_TIMESTAMPS:
+                batch.alter_column(
+                    column,
+                    existing_type=sa.BigInteger(),
+                    type_=sa.Integer(),
+                    existing_nullable=column != "scheduled_at",
+                )
 
     with op.batch_alter_table("scheduled_tasks") as batch:
         batch.drop_index("ix_scheduled_tasks_due")
         batch.drop_column("delegation_ref")
         batch.drop_column("project_id")
         batch.drop_column("next_run_at")
+        if op.get_bind().dialect.name != "cockroachdb":
+            for column in _TASK_TIMESTAMPS:
+                batch.alter_column(
+                    column,
+                    existing_type=sa.BigInteger(),
+                    type_=sa.Integer(),
+                    existing_nullable=column != "created_at",
+                )

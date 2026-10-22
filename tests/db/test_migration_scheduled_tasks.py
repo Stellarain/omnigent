@@ -75,7 +75,13 @@ def test_migration_creates_both_tables(db_engine: Engine) -> None:
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     """``scheduled_tasks`` has the full expected column set."""
-    cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_tasks")}
+    columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_tasks")}
+    for name in ("last_run_at", "created_at", "updated_at", "next_run_at"):
+        # The CockroachDB dialect reflects INT8 as SQLAlchemy Integer.
+        timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
+        assert isinstance(columns[name]["type"], timestamp_type)
+        assert columns[name]["nullable"] is (name != "created_at")
+    cols = set(columns)
     assert cols == {
         "workspace_id",
         "id",
@@ -108,7 +114,13 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
     """``scheduled_task_runs`` has the full expected column set."""
-    cols = {c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
+    columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")}
+    for name in ("scheduled_at", "fired_at", "finished_at", "lease_expires_at"):
+        # The CockroachDB dialect reflects INT8 as SQLAlchemy Integer.
+        timestamp_type = sa.Integer if db_engine.dialect.name == "cockroachdb" else sa.BigInteger
+        assert isinstance(columns[name]["type"], timestamp_type)
+        assert columns[name]["nullable"] is (name != "scheduled_at")
+    cols = set(columns)
     assert cols == {
         "workspace_id",
         "id",
@@ -464,7 +476,9 @@ def test_dispatch_migration_preserves_history_and_round_trips(
                 rrule="FREQ=DAILY",
                 agent_id=b"g" * 16,
                 timezone="UTC",
-                created_at=1,
+                created_at=2**31 - 1,
+                last_run_at=2**31 - 1,
+                updated_at=2**31 - 1,
             )
         )
         conn.execute(
@@ -474,7 +488,9 @@ def test_dispatch_migration_preserves_history_and_round_trips(
                     "id": run_id,
                     "scheduled_task_id": b"a" * 16,
                     "status": 3,
-                    "scheduled_at": 100,
+                    "scheduled_at": 2**31 - 1,
+                    "fired_at": 2**31 - 1,
+                    "finished_at": 2**31 - 1,
                 }
                 for run_id in (b"1" * 16, b"2" * 16)
             ],
@@ -492,13 +508,22 @@ def test_dispatch_migration_preserves_history_and_round_trips(
             rows = conn.execute(sa.select(*(table.c[column] for column in columns))).all()
             assert rows and all(tuple(row) == (None, None, None) for row in rows)
     with engine.begin() as conn:
+        for table, fields in (
+            (new_tasks, ("created_at", "last_run_at", "updated_at")),
+            (new_runs, ("scheduled_at", "fired_at", "finished_at")),
+        ):
+            query = sa.select(*(table.c[field] for field in fields))
+            assert all(tuple(row) == (2**31 - 1,) * 3 for row in conn.execute(query))
+            conn.execute(table.update().values(**dict.fromkeys(fields, 2**31 + 100)))
+            assert all(tuple(row) == (2**31 + 100,) * 3 for row in conn.execute(query))
+            conn.execute(table.update().values(**dict.fromkeys(fields, 2**31 - 1)))
         # An old writer can still insert an occurrence with the same timestamp.
         conn.execute(
             runs.insert().values(
                 id=b"3" * 16,
                 scheduled_task_id=b"a" * 16,
                 status=3,
-                scheduled_at=100,
+                scheduled_at=2**31 - 1,
             )
         )
         conn.execute(
@@ -541,10 +566,76 @@ def test_dispatch_migration_preserves_history_and_round_trips(
     assert {c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")} == set(
         runs.c.keys()
     )
+    for table_name, fields in (
+        ("scheduled_tasks", ("created_at", "last_run_at", "updated_at")),
+        ("scheduled_task_runs", ("scheduled_at", "fired_at", "finished_at")),
+    ):
+        for column in sa.inspect(engine).get_columns(table_name):
+            if column["name"] in fields and engine.dialect.name != "cockroachdb":
+                assert isinstance(column["type"], sa.Integer)
+                assert not isinstance(column["type"], sa.BigInteger)
     with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.created_at)).scalar_one() == 2**31 - 1
+        assert conn.execute(sa.select(runs.c.scheduled_at)).scalars().all() == [2**31 - 1] * 3
         assert conn.execute(sa.select(runs.c.status)).scalars().all() == [3, 3, 3]
         config.attributes["connection"] = conn
         command.upgrade(config, _DISPATCH_REVISION)
+
+
+@pytest.mark.parametrize("timestamp", [-(2**31) - 1, 2**31])
+def test_dispatch_downgrade_refuses_out_of_range_timestamps(
+    dispatch_migration_engine: Engine, timestamp: int
+) -> None:
+    engine = dispatch_migration_engine
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"a" * 16,
+                name="daily",
+                prompt=b"p",
+                rrule="FREQ=DAILY",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                created_at=1,
+            )
+        )
+        conn.execute(
+            runs.insert().values(
+                id=b"1" * 16,
+                scheduled_task_id=b"a" * 16,
+                status=3,
+                scheduled_at=1,
+            )
+        )
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    for table, fields in (
+        (tasks, ("created_at", "last_run_at", "updated_at")),
+        (runs, ("scheduled_at", "fired_at", "finished_at")),
+    ):
+        for field in fields:
+            with engine.begin() as conn:
+                conn.execute(table.update().values(**{field: timestamp}))
+            with (
+                pytest.raises(RuntimeError, match="timestamps outside signed 32-bit"),
+                engine.begin() as conn,
+            ):
+                config.attributes["connection"] = conn
+                command.downgrade(config, _DISPATCH_PREVIOUS)
+            with engine.begin() as conn:
+                assert conn.execute(sa.select(table.c[field])).scalar_one() == timestamp
+                assert (
+                    conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+                    == _DISPATCH_REVISION
+                )
+                conn.execute(table.update().values(**{field: 1}))
+            assert "next_run_at" in {
+                c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")
+            }
+            assert "trigger_key" in {
+                c["name"] for c in sa.inspect(engine).get_columns("scheduled_task_runs")
+            }
 
 
 def test_dispatch_downgrade_refuses_starting_runs(dispatch_migration_engine: Engine) -> None:

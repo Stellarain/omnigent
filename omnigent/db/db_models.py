@@ -1541,12 +1541,12 @@ class SqlScheduledTask(OmnigentBase):
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
-    last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    created_at: Mapped[int] = mapped_column(Integer)
-    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
@@ -1623,9 +1623,9 @@ class SqlScheduledTaskRun(OmnigentBase):
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # SCHEDULED_TASK_RUN_STATUS int code; 6 is reserved for starting.
     status: Mapped[int] = mapped_column(SmallInteger)
-    scheduled_at: Mapped[int] = mapped_column(Integer)
-    fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheduled_at: Mapped[int] = mapped_column(BigInteger)
+    fired_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Short, queryable failure classification token (e.g. "timeout",
