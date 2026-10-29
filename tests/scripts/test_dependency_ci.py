@@ -201,6 +201,49 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     )
 
 
+@pytest.mark.parametrize(
+    "path,status,runs_tooling",
+    [
+        ("omnigent/server/app.py", "modified", False),
+        ("web/src/App.tsx", "modified", False),
+        ("tests/server/test_app.py", "A", False),
+        (".github/workflows/merge-ready.yml", "modified", True),
+        (".github/scripts/merge-ready/required.sh", "modified", True),
+        ("scripts/install_oss.sh", "modified", True),
+        ("dev/lint/custom_lint.py", "modified", True),
+        ("tests/scripts/test_dependency_ci.py", "modified", True),
+        ("tests/conftest.py", "modified", True),
+        ("uv.lock", "modified", True),
+        ("deploy/docker/Dockerfile.alpine", "A", True),
+        ("examples/new-extension/web/package.json", "D", True),
+    ],
+)
+def test_ci_tooling_tests_run_only_when_tooling_can_change(
+    scope_module, path, status, runs_tooling
+):
+    selection = scope_module.select_scope([{"filename": path, "status": status}])
+    groups = [row["group"] for row in json.loads(selection["python_matrix"])["include"]]
+    assert ("ci-tooling" in groups) == runs_tooling
+    assert "misc" in groups
+
+
+@pytest.mark.parametrize("reason", ["Push, scheduled and manual runs use full CI", ""])
+def test_unscoped_runs_include_ci_tooling(scope_module, reason):
+    selection = scope_module.select_scope([], reason=reason)
+    assert json.loads(selection["python_matrix"])["include"] == json.loads(
+        (CI / "python-matrix.json").read_text()
+    )
+
+
+def test_ci_tooling_tests_leave_the_catch_all_shard():
+    groups = {
+        row["group"]: row["paths"].split()
+        for row in json.loads((CI / "python-matrix.json").read_text())
+    }
+    assert groups["ci-tooling"] == ["tests/scripts"]
+    assert "--ignore=tests/scripts" in groups["misc"]
+
+
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
     paths = [
         "web/android/gradlew",
@@ -444,6 +487,69 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
         assert bool(matrix["include"]) == selected
 
 
+@pytest.mark.parametrize("script", ["integration-matrix.sh", "e2e-shard-matrix.sh"])
+@pytest.mark.parametrize(
+    ("event", "draft", "run_tests", "selected"),
+    [
+        ("pull_request", "false", "false", False),
+        ("pull_request", "true", "true", False),
+        ("pull_request", "false", "true", True),
+        ("schedule", "", "true", True),
+        ("workflow_dispatch", "", "true", True),
+    ],
+)
+def test_matrix_skip_output_matches_job_guard(tmp_path, script, event, draft, run_tests, selected):
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", str(CI / script)],
+        env=dict(
+            os.environ,
+            GITHUB_OUTPUT=str(output),
+            EVENT_NAME=event,
+            IS_DRAFT=draft,
+            RUN_TESTS=run_tests,
+            NUM_SHARDS="4",
+        ),
+        check=True,
+    )
+    matrix = output.read_text().strip().removeprefix("matrix=")
+    assert (matrix != '{"include":[]}') == selected
+    assert bool(json.loads(matrix)["include"]) == selected
+
+
+@pytest.mark.parametrize(
+    ("dependency", "ui_scope", "rendered"),
+    [
+        ("true", "full", True),
+        ("true", "none", False),
+        ("true", "sidecar", False),
+        ("false", "full", True),
+    ],
+)
+def test_ui_snapshot_detect_renders_web_dependency_bumps(tmp_path, dependency, ui_scope, rendered):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ui-snapshot.yml").read_text())
+    step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
+    fake_gh = tmp_path / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\nprintf 'pnpm-lock.yaml\\nweb/package.json\\n'\n")
+    fake_gh.chmod(0o755)
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        env=dict(
+            os.environ,
+            PATH=f"{fake_gh.parent}{os.pathsep}{os.environ['PATH']}",
+            GITHUB_OUTPUT=str(output),
+            DEPENDENCY=dependency,
+            UI_SCOPE=ui_scope,
+            PR="1",
+            REPO="omnigent-ai/omnigent",
+        ),
+        check=True,
+    )
+    assert output.read_text().strip() == f"ui={str(rendered).lower()}"
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -497,6 +603,11 @@ def test_workflows_connect_selection_to_jobs():
         assert any(
             step.get("uses") == "./.github/actions/dependency-ci-scope" for step in setup["steps"]
         )
+    for name in ("integration", "e2e", "e2e-ui"):
+        job = workflows[name]["jobs"][name]
+        # Job conditions run before GitHub expands (and rejects) an empty matrix.
+        assert job.get("if") == "needs.setup.outputs.matrix != '{\"include\":[]}'"
+        assert job["strategy"]["matrix"] == "${{ fromJSON(needs.setup.outputs.matrix) }}"
     assert workflows["ci"]["jobs"]["scope"]["name"] == "CI coverage scope"
     assert workflows["e2e"]["jobs"]["setup"]["name"] == "E2E coverage scope"
     assert workflows["e2e-ui"]["jobs"]["setup"]["name"] == "UI coverage scope"
@@ -508,8 +619,18 @@ def test_workflows_connect_selection_to_jobs():
     peer_check = next(
         step for step in web_steps if step.get("name") == "Validate changed dependency peers"
     )
-    assert "needs.scope.outputs.dependency == 'true'" in peer_check["if"]
+    assert peer_check["if"] == "github.event_name == 'pull_request'"
     assert "check_npm_peers.py --base HEAD^1" in peer_check["run"]
+    peer_setup = next(
+        step
+        for step in web_steps
+        if step.get("name") == "Set up uv for dependency peer validation"
+    )
+    assert peer_setup["if"] == peer_check["if"]
+    # Full CI must retain the consumers checked for dependency-only changes.
+    for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert "if" not in step
     e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
     e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
     action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())
@@ -520,7 +641,7 @@ def test_workflows_connect_selection_to_jobs():
     matrix = next(
         step for step in workflows["e2e"]["jobs"]["setup"]["steps"] if step.get("id") == "matrix"
     )
-    assert matrix["env"]["NUM_SHARDS"] == "4"
+    assert matrix["env"]["NUM_SHARDS"] == "8"
     jobs = workflows["ci"]["jobs"]
     sidecar_cache = next(
         step for step in jobs["codex-parity"]["steps"] if step.get("id") == "sidecar-cache"
@@ -766,8 +887,8 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     )
 
 
-_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
-    f"E2E Tests (shard {index}/2)" for index in range(2)
+_E2E_SHARDS = [
+    f"E2E Tests (shard {index}/{count})" for count in (2, 4, 8) for index in range(count)
 ]
 
 
@@ -776,14 +897,14 @@ def _gate_snapshot(
     e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
     failed: str | None = None,
 ) -> dict[str, Any]:
-    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+    """One API snapshot in which only ``E2E Tests (shard 7/8)`` may be unfinished.
 
     :param shard_status: Status of that shard's check run.
     :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
     :param failed: A required check to report as completed with a failure.
     """
     checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
-    checks["E2E Tests (shard 1/4)"] = shard_status
+    checks["E2E Tests (shard 7/8)"] = shard_status
     runs = [
         {
             "name": name,
@@ -821,6 +942,35 @@ def _gate_snapshot(
     }
 
 
+@pytest.mark.parametrize(
+    ("status", "conclusion", "green"),
+    [
+        ("completed", "success", True),
+        ("completed", "failure", False),
+        ("completed", "cancelled", False),
+        ("in_progress", None, False),
+    ],
+)
+def test_merge_gate_requires_successful_workflow_for_empty_integration(
+    tmp_path, status, conclusion, green
+):
+    snapshot = _gate_snapshot("completed")
+    snapshot["checks"]["check_runs"].append(
+        {
+            "id": 100,
+            "name": "Integration (${{ matrix.name }})",
+            "status": "completed",
+            "conclusion": "skipped",
+        }
+    )
+    run = next(
+        run for run in snapshot["runs"]["workflow_runs"] if run["name"] == "Integration Tests"
+    )
+    run.update(status=status, conclusion=conclusion)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == green, process.stdout + process.stderr
+
+
 def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     """A completed workflow's check that still reads as running is re-read, not failed."""
     lagging = _gate_snapshot("in_progress")
@@ -831,11 +981,19 @@ def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     assert "All required checks green" in process.stdout
 
 
+@pytest.mark.parametrize("shard_id", range(8))
+def test_merge_gate_blocks_each_failed_eight_shard_check(tmp_path, shard_id):
+    name = f"E2E Tests (shard {shard_id}/8)"
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("completed", failed=name)])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert name in (tmp_path / "gate-output").read_text()
+
+
 def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
     process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 6
-    assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
+    assert "E2E Tests (shard 7/8)" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(

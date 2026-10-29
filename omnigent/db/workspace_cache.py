@@ -150,8 +150,10 @@ class WorkspaceScopedCache(Generic[K, V]):
     def update(self, other: Mapping[K, V]) -> None:
         """Merge *other*'s entries into the current workspace's slice."""
         ws = current_workspace_id()
+        # Source reads may reenter this cache; only backing writes need its lock.
+        entries = list(other.items())
         with self._lock, self._reset_on_backing_error("update"):
-            for key, value in other.items():
+            for key, value in entries:
                 self._backing[(ws, key)] = value
 
     @overload

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import MappingProxyType
 from typing import Any
 
 import cachetools
@@ -66,6 +67,41 @@ def test_update_is_workspace_scoped() -> None:
         assert cache["a"] == 9
     with workspace_scope(1):
         assert cache["a"] == 1
+
+
+def test_update_from_own_mapping_proxy_completes() -> None:
+    cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+    cache.update({"a": 1, "b": 2})
+    errors: list[Exception] = []
+
+    def update_from_proxy() -> None:
+        try:
+            cache.update(MappingProxyType(cache))
+        except Exception as error:
+            errors.append(error)
+
+    # A regression must fail within the timeout, not leave a blocking worker.
+    worker = threading.Thread(target=update_from_proxy, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "update deadlocked while reading its own mapping proxy"
+    assert errors == []
+    assert cache.items() == [("a", 1), ("b", 2)]
+
+
+def test_update_source_error_preserves_destination() -> None:
+    class FailingSource(dict[str, int]):
+        def items(self) -> Any:
+            yield "new", 2
+            raise RuntimeError("source failed")
+
+    cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache(reset_on_error=True)
+    cache["existing"] = 1
+
+    with pytest.raises(RuntimeError, match="source failed"):
+        cache.update(FailingSource())
+
+    assert cache.items() == [("existing", 1)]
 
 
 def test_pop_scoped_and_default() -> None:
