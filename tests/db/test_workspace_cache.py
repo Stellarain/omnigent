@@ -282,7 +282,7 @@ def test_concurrent_access_to_ttl_backing_is_serialized() -> None:
         except Exception as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=hammer, args=(worker,)) for worker in range(8)]
+    threads = [threading.Thread(target=hammer, args=(worker,), daemon=True) for worker in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
