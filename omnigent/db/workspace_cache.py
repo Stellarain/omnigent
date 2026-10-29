@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
 from typing import Any, Generic, TypeVar, overload
 
 from omnigent.db.db_models import current_workspace_id
@@ -87,15 +88,21 @@ class WorkspaceScopedCache(Generic[K, V]):
     def _scoped(self, key: K) -> tuple[int, K]:
         return (current_workspace_id(), key)
 
-    def _reset_after_error(self, operation: str, error: Exception) -> None:
-        """Replace a backing mapping whose internal state raised; lock held."""
-        _logger.warning(
-            "Resetting workspace-scoped cache after %s failed on %s",
-            operation,
-            type(self._backing).__name__,
-            exc_info=error,
-        )
-        self._backing = self._factory()
+    @contextmanager
+    def _reset_on_backing_error(self, operation: str) -> Iterator[None]:
+        """Caller holds the lock so a failed operation and reset stay atomic."""
+        try:
+            yield
+        except Exception as error:
+            if not self._reset_on_error:
+                raise
+            _logger.warning(
+                "Resetting workspace-scoped cache after %s failed on %s",
+                operation,
+                type(self._backing).__name__,
+                exc_info=error,
+            )
+            self._backing = self._factory()
 
     def __getitem__(self, key: K) -> V:
         with self._lock:
@@ -103,13 +110,8 @@ class WorkspaceScopedCache(Generic[K, V]):
 
     def __setitem__(self, key: K, value: V) -> None:
         scoped = self._scoped(key)
-        with self._lock:
-            try:
-                self._backing[scoped] = value
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("set", error)
+        with self._lock, self._reset_on_backing_error("set"):
+            self._backing[scoped] = value
 
     def __delitem__(self, key: K) -> None:
         with self._lock:
@@ -117,14 +119,9 @@ class WorkspaceScopedCache(Generic[K, V]):
 
     def __contains__(self, key: object) -> bool:
         scoped = (current_workspace_id(), key)
-        with self._lock:
-            try:
-                return scoped in self._backing
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("contains", error)
-                return False
+        with self._lock, self._reset_on_backing_error("contains"):
+            return scoped in self._backing
+        return False
 
     @overload
     def get(self, key: K) -> V | None:
@@ -140,37 +137,22 @@ class WorkspaceScopedCache(Generic[K, V]):
 
     def get(self, key: K, default: Any = None) -> Any:
         scoped = self._scoped(key)
-        with self._lock:
-            try:
-                return self._backing.get(scoped, default)
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("get", error)
-                return default
+        with self._lock, self._reset_on_backing_error("get"):
+            return self._backing.get(scoped, default)
+        return default
 
     def setdefault(self, key: K, default: V) -> V:
         scoped = self._scoped(key)
-        with self._lock:
-            try:
-                return self._backing.setdefault(scoped, default)
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("setdefault", error)
-                return default
+        with self._lock, self._reset_on_backing_error("setdefault"):
+            return self._backing.setdefault(scoped, default)
+        return default
 
     def update(self, other: Mapping[K, V]) -> None:
         """Merge *other*'s entries into the current workspace's slice."""
         ws = current_workspace_id()
-        with self._lock:
-            try:
-                for key, value in other.items():
-                    self._backing[(ws, key)] = value
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("update", error)
+        with self._lock, self._reset_on_backing_error("update"):
+            for key, value in other.items():
+                self._backing[(ws, key)] = value
 
     @overload
     def pop(self, key: K) -> V:
@@ -185,13 +167,9 @@ class WorkspaceScopedCache(Generic[K, V]):
         with self._lock:
             if default is _MISSING:
                 return self._backing.pop(scoped)
-            try:
+            with self._reset_on_backing_error("pop"):
                 return self._backing.pop(scoped, default)
-            except Exception as error:
-                if not self._reset_on_error:
-                    raise
-                self._reset_after_error("pop", error)
-                return default
+        return default
 
     def keys(self) -> list[K]:
         """Current workspace's keys, in backing order (a snapshot)."""
