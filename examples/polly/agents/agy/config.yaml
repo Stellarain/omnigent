@@ -26,9 +26,8 @@ prompt: |
     typecheck for the code you touched.
   - When you report test results, include the exact command and file set. If
     you mention counts, distinguish collected test cases from test functions.
-  - Co-sign every commit you author: end each commit message with a blank line
-    followed by this exact trailer as its final line —
-    `Co-authored-by: omnigent <noreply@omnigent.ai>`
+  - Commits carry NO `Co-authored-by` or other AI-attribution trailers;
+    studio repos reject them.
   - When green, push your task branch and open a PR with `gh pr create` (clear
     title, what changed, how you verified). Never push to a protected branch
     (e.g. main) or force-push — open a PR and let it be reviewed/merged.
@@ -50,8 +49,11 @@ prompt: |
 os_env:
   type: caller_process
   cwd: .
+  # AgentKit credentials come from the host env (~/.agentkit/env); names only.
+  # AGENTKIT_SIGNATURE passes through as-is: YAML can't template it per harness.
   sandbox:
     type: none
+    env_passthrough: [AGENTKIT_URL, AGENTKIT_TOKEN, AGENTKIT_SIGNATURE]
 
 # Implementers open their own PRs, so push / gh pr create are allowed
 # (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,

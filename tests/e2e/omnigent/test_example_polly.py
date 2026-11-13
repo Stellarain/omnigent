@@ -6,7 +6,7 @@ Loads the bundle and asserts the distinctive wiring stays intact: the
 claude-sdk orchestrator brain, the seven cross-vendor coding sub-agents
 (claude_code / codex / opencode / cursor / hermes / agy / pi, which implement,
 review, and explore),
-the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
+the four spine skills, and the bounds/blast-radius guardrails. Pure spec-load
 — no LLM, no credentials.
 
 What breaks if this fails:
@@ -143,9 +143,28 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
     assert pi.os_env.type == "caller_process"
 
 
+def test_workers_get_agentkit_env_and_no_attribution_trailer(polly_spec: AgentSpec) -> None:
+    """
+    Every coding worker passes the AgentKit env through by name, and no
+    worker or the fanout skill tells workers to add a co-author trailer
+    (studio repos reject AI-attribution trailers).
+    """
+    agentkit_env = {"AGENTKIT_URL", "AGENTKIT_TOKEN", "AGENTKIT_SIGNATURE"}
+    for agent in polly_spec.sub_agents:
+        assert agent.os_env is not None and agent.os_env.sandbox is not None, agent.name
+        assert agentkit_env <= set(agent.os_env.sandbox.env_passthrough or []), agent.name
+        prompt = (_POLLY_BUNDLE / "agents" / agent.name / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+        assert "Co-authored-by: omnigent" not in prompt, agent.name
+    fanout = (_POLLY_BUNDLE / "skills" / "fanout" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Co-authored-by: omnigent" not in fanout
+
+
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
     """All spine skills are discovered from skills/<dir>/SKILL.md."""
     assert sorted(s.name for s in polly_spec.skills) == [
+        "agentkit",
         "cross-review",
         "fanout",
         "investigate",
