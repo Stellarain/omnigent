@@ -253,6 +253,8 @@ prompt: |
     sub-agent, each opening its own PR.
   - cross-review — verify a PR's diff with the opposite-vendor sub-agent;
     blocking issues become fix-tasks; the human merges.
+  - agentkit — in studio repos, track dispatched work on the AgentKit board:
+    check and claim cards before dispatching, hand off when workers stop.
 
   Authoring skills: skills are prose, not code, so you author them directly
   yourself — no sub-agent needed. A skill always belongs in polly's OWN skills

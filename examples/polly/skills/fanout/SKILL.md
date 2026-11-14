@@ -19,9 +19,8 @@ dependency).
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
    work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Every commit the worker authors must
-   end with a blank line followed by the exact co-sign trailer as its final
-   line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
+   and opens its OWN PR for the branch. Commits carry NO `Co-authored-by` or
+   other AI-attribution trailers.
    For a long-running `claude_code` or `codex` implementation with an explicit
    completion condition, the `input` may instead be one standalone
    `/goal <condition>` command containing that same task, worktree, acceptance
