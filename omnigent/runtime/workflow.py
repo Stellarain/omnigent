@@ -957,10 +957,22 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     anthropic, anthropic_err = _optional_provider_family(entry, ANTHROPIC_FAMILY)
     openai, openai_err = _optional_provider_family(entry, OPENAI_FAMILY)
     base_urls: dict[str, str] = {}
-    if anthropic is not None:
-        base_urls[_PI_FAMILY_KEY[ANTHROPIC_FAMILY]] = anthropic.base_url
-    if openai is not None:
-        base_urls[_PI_FAMILY_KEY[OPENAI_FAMILY]] = openai.base_url
+    # Configured token limits per family; without them Pi caps output at 16384.
+    model_limits: dict[str, dict[str, int]] = {}
+    for family_name, family in ((ANTHROPIC_FAMILY, anthropic), (OPENAI_FAMILY, openai)):
+        if family is None:
+            continue
+        base_urls[_PI_FAMILY_KEY[family_name]] = family.base_url
+        limits = {
+            key: value
+            for key, value in (
+                ("context_window", family.context_window),
+                ("max_output_tokens", family.max_output_tokens),
+            )
+            if value is not None
+        }
+        if limits:
+            model_limits[_PI_FAMILY_KEY[family_name]] = limits
     if not base_urls:
         # At least one family was configured (the provider passed parse-time
         # validation) but its credential could not be resolved. Surface the
@@ -989,6 +1001,8 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     assert auth_source is not None  # base_urls non-empty ⇒ one family resolved
     env[_HARNESS_GATEWAY_FLAG["pi"]] = "true"
     env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    if model_limits:
+        env["HARNESS_PI_GATEWAY_MODEL_LIMITS"] = json.dumps(model_limits, sort_keys=True)
     if openai is not None and openai.wire_api is not None:
         env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
     env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))

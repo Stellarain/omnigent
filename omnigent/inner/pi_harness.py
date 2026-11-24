@@ -35,6 +35,9 @@ Env vars read at startup:
   ``{"claude": "https://example.databricks.com/ai-gateway/anthropic"}``.
 - ``HARNESS_PI_GATEWAY_OPENAI_WIRE_API``: ``"responses"`` or ``"chat"``
   for a configured generic OpenAI-compatible provider.
+- ``HARNESS_PI_GATEWAY_MODEL_LIMITS``: JSON object of the provider's
+  configured token limits keyed by the same families, e.g.
+  ``{"openai": {"context_window": 1048576, "max_output_tokens": 65536}}``.
 - ``HARNESS_PI_CWD``: working directory the executor launches
   the Pi CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE`` if set,
   then to the subprocess's inherited cwd.
@@ -112,6 +115,8 @@ _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
 _ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
+_ENV_GATEWAY_MODEL_LIMITS = "HARNESS_PI_GATEWAY_MODEL_LIMITS"
+_MODEL_LIMIT_KEYS = ("context_window", "max_output_tokens")
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
 
@@ -158,6 +163,40 @@ def _resolve_gateway_base_urls() -> dict[str, str] | None:
         _logger.warning("Ignoring non-object %s value", _ENV_GATEWAY_BASE_URLS)
         return None
     return {str(key): str(item) for key, item in value.items() if isinstance(item, str)}
+
+
+def _resolve_gateway_model_limits() -> dict[str, dict[str, int]] | None:
+    """
+    Decode the provider's configured token limits from the gateway env var.
+
+    :returns: Mapping of Pi provider family to positive ``context_window`` /
+        ``max_output_tokens`` values, or ``None`` when unset or invalid.
+    """
+    raw = os.environ.get(_ENV_GATEWAY_MODEL_LIMITS, "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning("Ignoring invalid %s JSON", _ENV_GATEWAY_MODEL_LIMITS)
+        return None
+    if not isinstance(value, dict):
+        _logger.warning("Ignoring non-object %s value", _ENV_GATEWAY_MODEL_LIMITS)
+        return None
+    resolved: dict[str, dict[str, int]] = {}
+    for family, limits in value.items():
+        if not isinstance(limits, dict):
+            continue
+        valid = {
+            key: limit
+            for key in _MODEL_LIMIT_KEYS
+            if isinstance(limit := limits.get(key), int)
+            and not isinstance(limit, bool)
+            and limit > 0
+        }
+        if valid:
+            resolved[str(family)] = valid
+    return resolved or None
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -239,6 +278,7 @@ def _build_pi_executor() -> Executor:
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         base_urls_override=_resolve_gateway_base_urls(),
+        model_limits_override=_resolve_gateway_model_limits(),
         openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
