@@ -1822,6 +1822,36 @@ def test_pi_gateway_default_pi_scope_resolved_credential_succeeds(
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-gw-secret"
     assert env["HARNESS_PI_MODEL"] == "some-model-id"
+    assert "HARNESS_PI_GATEWAY_MODEL_LIMITS" not in env
+
+
+def test_pi_gateway_forwards_configured_model_limits(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A family's ``context_window`` / ``max_output_tokens`` reach the pi harness env."""
+    monkeypatch.setenv("MY_GATEWAY_TOKEN", "sk-gw-secret")
+    config: dict[str, object] = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "api_key_ref": "env:MY_GATEWAY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "deepseek-v4-pro"},
+                    "context_window": 1048576,
+                    "max_output_tokens": 65536,
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+    assert json.loads(env["HARNESS_PI_GATEWAY_MODEL_LIMITS"]) == {
+        "openai": {"context_window": 1048576, "max_output_tokens": 65536}
+    }
 
 
 _DISMISSIBLE_CODEX_CONFIG_TOML = """

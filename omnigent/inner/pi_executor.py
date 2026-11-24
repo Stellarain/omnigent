@@ -833,6 +833,7 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
+    model_limits: Mapping[str, Mapping[str, int]] | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -860,6 +861,9 @@ def _build_models_json(
         wire surfaces. Missing GPT metadata defaults to Responses.
     :param openai_wire_api: Configured wire for a generic OpenAI-compatible
         provider. ``None`` defaults generic providers to Chat Completions.
+    :param model_limits: The provider's configured ``context_window`` /
+        ``max_output_tokens`` keyed like *base_urls*; applied to *model* when
+        it registers on that family's generic provider.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
@@ -1004,11 +1008,25 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            if any(
-                url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
-                for url in (base_urls or {}).values()
-            ):
-                model_entry = pi_generic_model_json_entry(model)
+            generic_families = [
+                family
+                for family, url in (base_urls or {}).items()
+                if url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
+            ]
+            if generic_families:
+                limits = next(
+                    (
+                        (model_limits or {})[family]
+                        for family in generic_families
+                        if family in (model_limits or {})
+                    ),
+                    {},
+                )
+                model_entry = pi_generic_model_json_entry(
+                    model,
+                    configured_context_window=limits.get("context_window"),
+                    configured_max_output_tokens=limits.get("max_output_tokens"),
+                )
             else:
                 model_entry = {"id": model, "input": ["text", "image"]}
                 if pi_model_is_reasoning(model) or (
@@ -1037,6 +1055,39 @@ def _build_models_json(
 # turn dies with "Stream ended without finish_reason".
 # Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
 # so they no longer need this flag.
+# Pi's ``maxTokens`` for a models.json entry that declares none.
+_PI_DEFAULT_MAX_TOKENS = 16384
+
+
+def _pi_registered_max_tokens(
+    models_json: _PiModelsConfig, provider: str, model: str
+) -> int | None:
+    """Return the ``maxTokens`` Pi applies to *model* under *provider*, if registered."""
+    provider_config = models_json["providers"].get(provider)
+    for entry in provider_config["models"] if provider_config is not None else []:
+        if entry.get("id") == model:
+            max_tokens = entry.get("maxTokens", _PI_DEFAULT_MAX_TOKENS)
+            return max_tokens if isinstance(max_tokens, int) else None
+    return None
+
+
+def _pi_message_has_tool_calls(message: Mapping[str, object]) -> bool:
+    """Whether a Pi assistant message carries any ``toolCall`` content block."""
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "toolCall" for block in content
+    )
+
+
+def _pi_output_token_limit_error(max_tokens: int | None) -> str:
+    """Describe a reply Pi cut off at its output token cap."""
+    limit = f"maxTokens={max_tokens}" if max_tokens is not None else "maxTokens unknown"
+    return (
+        f"Pi output token limit reached ({limit}); the reply was cut off. "
+        "Raise max_output_tokens for this model in the provider config."
+    )
+
+
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -1452,6 +1503,8 @@ class _PiSessionState:
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
+    # ``maxTokens`` the models.json registers for ``model``; ``None`` when unknown.
+    max_output_tokens: int | None = None
     _has_sent_prompt: bool = False
 
 
@@ -2128,6 +2181,7 @@ class PiExecutor(Executor):
         gateway_host: str | None = None,
         base_url_override: str | None = None,
         base_urls_override: dict[str, str] | None = None,
+        model_limits_override: Mapping[str, Mapping[str, int]] | None = None,
         openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
@@ -2174,6 +2228,9 @@ class PiExecutor(Executor):
             the Databricks profile credentials.
         :param base_urls_override: ucode-provided Pi gateway URLs keyed by
             model family, e.g. ``{"claude": "...", "openai": "..."}``.
+        :param model_limits_override: The provider's configured token limits
+            keyed by the same families, e.g.
+            ``{"openai": {"max_output_tokens": 65536}}``.
         :param openai_wire_api: Configured generic-provider OpenAI wire,
             ``"responses"`` or ``"chat"``. Databricks ignores this and uses
             live Unity Catalog metadata.
@@ -2229,6 +2286,7 @@ class PiExecutor(Executor):
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
         self._base_url_override = base_url_override
         self._base_urls_override = base_urls_override
+        self._model_limits_override = model_limits_override
         if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
             raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
         self._openai_wire_api = openai_wire_api
@@ -2952,6 +3010,7 @@ class PiExecutor(Executor):
                 catalog_models=self._gateway_model_entries or (),
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
+                model_limits=self._model_limits_override,
             )
 
         if state.rpc is not None:
@@ -2980,8 +3039,11 @@ class PiExecutor(Executor):
                 only_family=_only_configured_family(self._base_urls_override),
             )
             pi_model = f"{provider}/{effective_model}"
+            assert models_json is not None
+            max_output_tokens = _pi_registered_max_tokens(models_json, provider, effective_model)
         else:
             pi_model = effective_model
+            max_output_tokens = None
 
         await rpc.start(
             self._pi_launch_path,
@@ -2996,6 +3058,7 @@ class PiExecutor(Executor):
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
+        state.max_output_tokens = max_output_tokens
         state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
@@ -3155,11 +3218,9 @@ class PiExecutor(Executor):
                         message=f"Pi process ended without response.{stderr_suffix}"
                     )
                 else:
-                    turn_usage = _aggregate_pi_turn_usage(message_usages, model)
-                    _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(
-                        response=response_text,
-                        usage=dict(turn_usage) if turn_usage is not None else None,
+                    # Streamed text without ``agent_end`` is a partial reply, not a finish.
+                    yield ExecutorError(
+                        message=f"Pi process ended before the turn completed.{stderr_suffix}"
                     )
                 return
 
@@ -3392,6 +3453,12 @@ class PiExecutor(Executor):
                         # settlement that follows) rather than leave it queued.
                         pending_error = error
                         awaiting_error_agent_end = True
+                    elif stop == "length" and not _pi_message_has_tool_calls(msg):
+                        # Cut off at maxTokens with no tool call to run: the turn
+                        # ends here truncated, so fail it at the turn boundary.
+                        pending_error = _pi_output_token_limit_error(
+                            turn_state.max_output_tokens if turn_state is not None else None
+                        )
                     elif stop is not None:
                         # A later completed assistant message means pi recovered.
                         pending_error = None

@@ -107,6 +107,15 @@ def test_executor_factory_reads_env_vars(
         ),
     )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", "responses")
+    monkeypatch.setenv(
+        "HARNESS_PI_GATEWAY_MODEL_LIMITS",
+        json.dumps(
+            {
+                "openai": {"context_window": 1048576, "max_output_tokens": 65536},
+                "claude": {"max_output_tokens": 0, "context_window": "big"},
+            }
+        ),
+    )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "1234")
     monkeypatch.setenv("HARNESS_PI_CWD", "/tmp/test-cwd")
@@ -130,8 +139,10 @@ def test_executor_factory_reads_env_vars(
         openai_wire_api: str | None,
         gateway_auth_command: str | None,
         gateway_auth_refresh_interval_ms: str | None,
+        model_limits_override: dict[str, dict[str, int]] | None,
         **_kwargs: Any,
     ) -> None:
+        captured["model_limits_override"] = model_limits_override
         captured["cwd"] = cwd
         captured["os_env"] = os_env
         captured["model"] = model
@@ -163,6 +174,10 @@ def test_executor_factory_reads_env_vars(
         "openai": "https://example.databricks.com/ai-gateway/codex/v1",
     }
     assert captured["openai_wire_api"] == "responses"
+    # Invalid limits are dropped; a family with none left is omitted.
+    assert captured["model_limits_override"] == {
+        "openai": {"context_window": 1048576, "max_output_tokens": 65536}
+    }
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "1234"
     assert captured["cwd"] == "/tmp/test-cwd"

@@ -749,6 +749,52 @@ def test_openai_only_family_routes_claude_named_model_to_openai_surface():
     assert "claude-k2.7" not in anthropic_ids
 
 
+@pytest.mark.parametrize(
+    ("model_limits", "expected_context", "expected_max_tokens"),
+    [
+        ({"openai": {"context_window": 1048576, "max_output_tokens": 65536}}, 1048576, 65536),
+        ({"openai": {"max_output_tokens": 65536}}, None, 65536),
+        ({"claude": {"max_output_tokens": 65536}}, None, None),
+        (None, None, None),
+    ],
+    ids=["both", "output-only", "other-family", "unset"],
+)
+def test_generic_provider_model_carries_configured_limits(
+    model_limits, expected_context, expected_max_tokens
+):
+    # Pi defaults a models.json entry without maxTokens to 16384, which a
+    # reasoning model can exhaust before it finishes a long tool call.
+    result = _build_models_json(
+        "https://gw.example.com",
+        "tok",
+        {"openai": "https://gw.example.com/v1"},
+        model="omnigent-test-unlisted-model",
+        model_limits=model_limits,
+    )
+    (entry,) = result["providers"]["databricks-completions"]["models"]
+    assert entry.get("contextWindow") == expected_context
+    assert entry.get("maxTokens") == expected_max_tokens
+
+
+def test_registered_max_tokens_reports_pi_default_for_unset_entry():
+    from omnigent.inner.pi_executor import _pi_registered_max_tokens
+
+    models_json = {
+        "providers": {
+            "gateway": {
+                "baseUrl": "https://gw.example.com/v1",
+                "apiKey": "tok",
+                "api": "openai-completions",
+                "models": [{"id": "capped", "maxTokens": 65536}, {"id": "uncapped"}],
+            }
+        }
+    }
+    assert _pi_registered_max_tokens(models_json, "gateway", "capped") == 65536
+    assert _pi_registered_max_tokens(models_json, "gateway", "uncapped") == 16384
+    assert _pi_registered_max_tokens(models_json, "gateway", "missing") is None
+    assert _pi_registered_max_tokens(models_json, "other", "capped") is None
+
+
 def test_databricks_claude_only_gateway_keeps_gpt_on_responses_surface():
     # The cli-config Databricks path serializes only the gateway's Anthropic
     # surface (workflow._apply_cli_config_databricks_to_pi), yet the same
@@ -6611,6 +6657,77 @@ def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -
     assert rpc._line_queue.empty()
 
 
+_TOOL_CALL_BLOCK = {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}}
+
+
+@pytest.mark.parametrize("pi_version", [_SETTLED_PI_VERSION, None], ids=["settled", "legacy"])
+@pytest.mark.parametrize(
+    ("stop_reason", "tool_call", "truncated"),
+    [
+        ("length", False, True),
+        ("length", True, False),
+        ("stop", False, False),
+        ("toolUse", True, False),
+    ],
+    ids=["length", "length-tool-call", "stop", "tool-use"],
+)
+def test_output_token_limit_stop_fails_the_turn(
+    pi_version: tuple[int, int, int] | None,
+    stop_reason: str,
+    tool_call: bool,
+    truncated: bool,
+) -> None:
+    """A reply cut off at maxTokens with no tool call to run is a failed turn."""
+    message = _assistant_message("partial", stop_reason=stop_reason)
+    if tool_call:
+        message["content"].append(_TOOL_CALL_BLOCK)
+    frames = [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame("partial"),
+        _rpc_frame(type="message_end", message=message),
+        _rpc_frame(type="agent_end", messages=[message], willRetry=False),
+    ]
+    if pi_version is not None:
+        frames.append(_rpc_frame(type="agent_settled"))
+    executor, rpc = _session_executor(frames, pi_version=pi_version)
+    executor._session_states[_SESSION_KEY].max_output_tokens = 65536
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    completions = [e for e in events if isinstance(e, TurnComplete)]
+    if truncated:
+        assert not completions
+        (error,) = errors
+        assert "output token limit reached (maxTokens=65536)" in error.message
+    else:
+        assert not errors
+        (turn_complete,) = completions
+        assert turn_complete.response == "partial"
+    assert rpc._line_queue.empty()
+
+
+def test_stdout_eof_after_streamed_text_is_not_a_clean_finish() -> None:
+    """Pi exiting mid-reply without ``agent_end`` fails the turn, even with text."""
+    executor, _rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(type="message_start", message={"role": "assistant"}),
+            _text_delta_frame("partial"),
+            None,
+        ],
+        pi_version=None,
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert not any(isinstance(e, TurnComplete) for e in events)
+    assert "Pi process ended before the turn completed" in events[-1].message
+
+
 @pytest.mark.parametrize("settled", [True, False], ids=["settled", "exited"])
 def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts(
     settled: bool,
@@ -6931,7 +7048,7 @@ async def test_generic_catalog_discovery_does_not_block_runtime(
     release = threading.Event()
     heartbeat_ran = False
 
-    def discover(model):
+    def discover(model, **limits):
         assert destination == "generic", "unused generic catalog lookup"
         started.set()
         assert release.wait(2), "catalog discovery blocked the runtime event loop"
