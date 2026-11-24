@@ -776,6 +776,50 @@ def test_generic_provider_model_carries_configured_limits(
     assert entry.get("maxTokens") == expected_max_tokens
 
 
+_SHARED_GATEWAY_LIMITS = {
+    "claude": {"context_window": 200000, "max_output_tokens": 8192},
+    "openai": {"context_window": 1048576, "max_output_tokens": 65536},
+}
+
+
+@pytest.mark.parametrize(
+    "base_urls",
+    [
+        {"claude": "http://gateway.example:4000/v1", "openai": "http://gateway.example:4000/v1"},
+        {"claude": "http://gateway.example:4000", "openai": "http://gateway.example:4000/v1"},
+    ],
+    ids=["same-url", "overlapping-url"],
+)
+@pytest.mark.parametrize("limited_families", [("claude", "openai"), ("claude",), ("openai",)])
+@pytest.mark.parametrize(
+    ("model", "provider_name", "routed_family"),
+    [
+        ("claude-test-unlisted-model", "databricks-anthropic", "claude"),
+        ("omnigent-test-unlisted-model", "databricks-completions", "openai"),
+    ],
+    ids=["claude-routed", "openai-routed"],
+)
+def test_shared_gateway_model_takes_its_routed_family_limits(
+    base_urls, limited_families, model, provider_name, routed_family
+):
+    # Two families on one LiteLLM proxy: each model gets the limits of the
+    # family it is routed through, never the other family's.
+    model_limits = {family: _SHARED_GATEWAY_LIMITS[family] for family in limited_families}
+    result = _build_models_json(
+        "http://gateway.example:4000",
+        "tok",
+        base_urls,
+        model=model,
+        model_limits=model_limits,
+    )
+    provider = result["providers"][provider_name]
+    assert provider["baseUrl"] == base_urls[routed_family]
+    (entry,) = [e for e in provider["models"] if e.get("id") == model]
+    expected = model_limits.get(routed_family, {})
+    assert entry.get("contextWindow") == expected.get("context_window")
+    assert entry.get("maxTokens") == expected.get("max_output_tokens")
+
+
 def test_registered_max_tokens_reports_pi_default_for_unset_entry():
     from omnigent.inner.pi_executor import _pi_registered_max_tokens
 

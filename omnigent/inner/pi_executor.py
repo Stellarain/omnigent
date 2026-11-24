@@ -862,8 +862,8 @@ def _build_models_json(
     :param openai_wire_api: Configured wire for a generic OpenAI-compatible
         provider. ``None`` defaults generic providers to Chat Completions.
     :param model_limits: The provider's configured ``context_window`` /
-        ``max_output_tokens`` keyed like *base_urls*; applied to *model* when
-        it registers on that family's generic provider.
+        ``max_output_tokens`` keyed like *base_urls*; applied to *model* from
+        the family whose surface it is routed to on a generic provider.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
@@ -990,14 +990,13 @@ def _build_models_json(
     if model is not None:
         # Explicit selections must launch even when picker compatibility
         # filtering hides the equivalent discovered entry.
-        provider = config["providers"][
-            _pi_provider_for_model(
-                model,
-                wire_catalog.get(model.lower()),
-                generic_openai_wire_api=generic_openai_wire_api,
-                only_family=_only_configured_family(base_urls),
-            )
-        ]
+        provider_name = _pi_provider_for_model(
+            model,
+            wire_catalog.get(model.lower()),
+            generic_openai_wire_api=generic_openai_wire_api,
+            only_family=_only_configured_family(base_urls),
+        )
+        provider = config["providers"][provider_name]
         if not any(entry.get("id") == model for entry in provider["models"]):
             # Declare image input: Pi's transformMessages drops every image
             # block ("model does not support images") unless the model entry
@@ -1008,20 +1007,14 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            generic_families = [
-                family
-                for family, url in (base_urls or {}).items()
-                if url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
-            ]
-            if generic_families:
-                limits = next(
-                    (
-                        (model_limits or {})[family]
-                        for family in generic_families
-                        if family in (model_limits or {})
-                    ),
-                    {},
-                )
+            if any(
+                url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
+                for url in (base_urls or {}).values()
+            ):
+                # Limits follow the family whose base URL this provider sends
+                # to, even when both families share one gateway URL.
+                routed_family = "claude" if provider_name == "databricks-anthropic" else "openai"
+                limits = (model_limits or {}).get(routed_family, {})
                 model_entry = pi_generic_model_json_entry(
                     model,
                     configured_context_window=limits.get("context_window"),
